@@ -225,7 +225,7 @@ Reference: [Zig Cookbook](https://zigcc.github.io/zig-cookbook/) for implementat
 
 ## Seeking Contributors
 
-This **ARCHITECTURALLY COMPLETE PROJECT** would benefit from expertise in:
+This **ARCHITECTURALLY COMPLETE DRAFT PROJECT** would benefit from expertise in:
 - **🧪 Validation & Testing** (comparing outputs with HuggingFace transformers)
 - **🔗 Model weight loading** (safetensors, HuggingFace format support)
 - **📝 BPE tokenization** (proper tokenizer implementation)
