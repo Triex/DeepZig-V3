@@ -59,11 +59,11 @@ Current LLM inference is dominated by Python/PyTorch, which introduces:
 | Memory usage | 20-40GB | **< 16GB** | *16GB+ for basic ops* |
 | Dependencies | ~2GB runtime | **Single binary** | ✅ **Single binary** |
 | Deployment | Complex | **Copy & run** | ✅ **Copy & run** |
-| Matrix Mul (1024×1024) | ~1ms (optimized) | **< 1ms** | ✅ **2.2ms (977 GFLOPS)** |
-| Peak Performance | ~1500 GFLOPS | **> 1000 GFLOPS** | ✅ **1143 GFLOPS** |
+| Matrix Mul (1024×1024) | ~1ms (optimized) | **< 1ms** | ✅ **2.1ms (1164 GFLOPS)** |
+| Peak Performance | ~1500 GFLOPS | **> 1000 GFLOPS** | ✅ **1164 GFLOPS** |
 | **MLA Attention** | ❌ Not available | **✅ Implemented** | ✅ **Architecture Complete** |
 
-*Benchmarked on Apple M1 MacBook Pro under heavy load*
+*Benchmarked on Apple M1 MacBook Pro under very heavy load*
 
 ## Why Zig?
 
