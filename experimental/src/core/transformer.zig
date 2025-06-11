@@ -314,7 +314,7 @@ pub const Transformer = struct {
             layer.* = try TransformerLayer.init(allocator, @intCast(i), config, backend);
         }
 
-        std.log.info("✅ Transformer initialization complete");
+        std.log.info("✅ Transformer initialization complete", .{});
         std.log.info("  Total layers: {}", .{config.num_hidden_layers});
         std.log.info("  MoE layers: {}", .{countMoELayers(config)});
         std.log.info("  Dense layers: {}", .{config.num_hidden_layers - countMoELayers(config)});
@@ -378,7 +378,7 @@ pub const Transformer = struct {
         // Copy final output
         @memcpy(output.data, current_hidden.data);
 
-        std.log.debug("✅ Transformer Forward completed successfully");
+        std.log.debug("✅ Transformer Forward completed successfully", .{});
     }
 
     /// Count MoE layers in configuration
