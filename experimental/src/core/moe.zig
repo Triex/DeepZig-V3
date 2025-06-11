@@ -43,6 +43,6 @@ pub const MoE = struct {
 
         @memcpy(output.data, input.data);
 
-        std.log.debug("🧮 MoE Forward (placeholder): copied input to output");
+        std.log.debug("🧮 MoE Forward (placeholder): copied input to output", .{});
     }
 };

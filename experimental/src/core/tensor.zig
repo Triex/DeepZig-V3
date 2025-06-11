@@ -237,6 +237,19 @@ pub fn Tensor(comptime dtype: TensorDType) type {
             }
         }
 
+        /// Fill tensor with sequential values for testing
+        pub fn fillSequential(self: *Self, start: DataType) void {
+            for (self.data, 0..) |*element, i| {
+                element.* = switch (DataType) {
+                    f32 => start + @as(f32, @floatFromInt(i)),
+                    f64 => start + @as(f64, @floatFromInt(i)),
+                    i32 => start + @as(i32, @intCast(i)),
+                    i8 => start + @as(i8, @intCast(i % 256)),
+                    else => unreachable,
+                };
+            }
+        }
+
         /// Element-wise addition with SIMD optimization
         pub fn add(self: *const Self, other: *const Self, result: *Self) !void {
             if (!std.mem.eql(usize, self.shape.dims, other.shape.dims)) {

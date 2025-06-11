@@ -62,7 +62,7 @@ const RoPE = struct {
         self.sin_cache.deinit();
     }
 
-    /// Apply rotary position encoding to query/key tensors
+    /// Apply rotary position encoding to query/key tensors (only to RoPE portion)
     pub fn apply(self: *const Self, tensor_data: *FloatTensor, seq_len: u32, start_pos: u32) !void {
         if (seq_len + start_pos > self.max_seq_len) {
             return AttentionError.InvalidSequenceLength;
@@ -70,19 +70,18 @@ const RoPE = struct {
 
         const batch_size = tensor_data.shape.dims[0];
         const num_heads = tensor_data.shape.dims[1];
-        const head_dim = tensor_data.shape.dims[3];
+        const total_head_dim = tensor_data.shape.dims[3];
 
-        if (head_dim != self.dim) {
-            return AttentionError.InvalidHeadDimension;
-        }
+        // RoPE is only applied to the rope portion (last part of head dimension)
+        const rope_offset = total_head_dim - self.dim;
 
         // Apply RoPE rotation: x_out = x * cos + rotate_half(x) * sin
         for (0..batch_size) |b| {
             for (0..num_heads) |h| {
                 for (0..seq_len) |s| {
                     const pos = start_pos + s;
-                    for (0..head_dim / 2) |i| {
-                        const base_idx = ((b * num_heads + h) * seq_len + s) * head_dim;
+                    for (0..self.dim / 2) |i| {
+                        const base_idx = ((b * num_heads + h) * seq_len + s) * total_head_dim + rope_offset;
                         const cos_val = self.cos_cache.data[pos * self.dim + 2 * i];
                         const sin_val = self.sin_cache.data[pos * self.dim + 2 * i];
 
@@ -99,7 +98,7 @@ const RoPE = struct {
 };
 
 /// KV Cache for efficient inference
-const KVCache = struct {
+pub const KVCache = struct {
     k_cache: FloatTensor,
     v_cache: FloatTensor,
     seq_len: u32,
@@ -155,7 +154,7 @@ const KVCache = struct {
             }
         }
 
-        self.seq_len = start_pos + new_seq_len;
+        self.seq_len = @intCast(start_pos + new_seq_len);
     }
 
     /// Get current keys from cache
@@ -259,7 +258,7 @@ pub const MultiHeadLatentAttention = struct {
     pub fn init(allocator: Allocator, config: MLAConfig, backend: Backend) !Self {
         try config.validate();
 
-        std.log.info("🧠 Initializing Multi-Head Latent Attention (MLA)");
+        std.log.info("🧠 Initializing Multi-Head Latent Attention (MLA)", .{});
         std.log.info("  Hidden size: {}", .{config.hidden_size});
         std.log.info("  Attention heads: {}", .{config.num_attention_heads});
         std.log.info("  KV heads: {}", .{config.num_key_value_heads});
@@ -432,7 +431,7 @@ pub const MultiHeadLatentAttention = struct {
         // Reshape back to original dimensions
         @memcpy(output.data, output_flat.data);
 
-        std.log.debug("✅ MLA Forward completed successfully");
+        std.log.debug("✅ MLA Forward completed successfully", .{});
     }
 };
 

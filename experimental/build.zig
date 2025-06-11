@@ -2,6 +2,7 @@
 // Copyright (C) 2025 TriexDev
 
 const std = @import("std");
+const builtin = @import("builtin");
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
@@ -119,6 +120,37 @@ pub fn build(b: *std.Build) void {
     const blas_bench_run = b.addRunArtifact(blas_bench_exe);
     const blas_bench_step = b.step("bench-blas", "Run BLAS-specific benchmarks");
     blas_bench_step.dependOn(&blas_bench_run.step);
+
+    // Ceate a validation test executable
+    const validation_exe = b.addExecutable(.{
+        .name = "validation-test",
+        .root_source_file = b.path("src/test_validation.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    // Add core modules
+    validation_exe.root_module.addImport("deepseek_core", deepseek_core);
+
+    // Link BLAS for validation
+    validation_exe.linkLibC();
+    if (builtin.os.tag == .macos) {
+        validation_exe.linkFramework("Accelerate");
+    } else if (builtin.os.tag == .linux) {
+        validation_exe.linkSystemLibrary("openblas");
+    }
+
+    b.installArtifact(validation_exe);
+
+    // Main validate run step (now using enhanced validation)
+    const validation_run_cmd = b.addRunArtifact(validation_exe);
+    validation_run_cmd.step.dependOn(b.getInstallStep());
+    if (b.args) |args| {
+        validation_run_cmd.addArgs(args);
+    }
+
+    const validation_run_step = b.step("validate", "Run comprehensive validation suite");
+    validation_run_step.dependOn(&validation_run_cmd.step);
 }
 
 /// Configure BLAS linking for the given compile step based on target platform
