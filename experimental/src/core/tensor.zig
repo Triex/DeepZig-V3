@@ -4,6 +4,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Random = std.Random;
+const builtin = @import("builtin");
 
 const blas = @import("blas.zig");
 const CoreError = @import("root.zig").CoreError;
@@ -145,6 +146,18 @@ pub const TensorShape = struct {
         return strides;
     }
 };
+
+/// Conditional logging that's disabled in release mode for optimal performance
+inline fn logInfo(comptime fmt: []const u8, args: anytype) void {
+    // Always show essential benchmark results
+    std.log.info(fmt, args);
+}
+
+inline fn logDebug(comptime fmt: []const u8, args: anytype) void {
+    if (builtin.mode == .Debug) {
+        std.log.debug(fmt, args);
+    }
+}
 
 /// High-performance tensor with BLAS acceleration
 pub fn Tensor(comptime dtype: TensorDType) type {
@@ -294,11 +307,11 @@ pub fn Tensor(comptime dtype: TensorDType) type {
                 switch (DataType) {
                     f32 => {
                         blas_context.matmul(f32, self.data, other.data, result.data, dims);
-                        std.log.debug("✅ BLAS-accelerated f32 matrix multiplication: {}x{} * {}x{}", .{ m, k, k, n });
+                        logDebug("✅ BLAS-accelerated f32 matrix multiplication: {}x{} * {}x{}", .{ m, k, k, n });
                     },
                     f64 => {
                         blas_context.matmul(f64, self.data, other.data, result.data, dims);
-                        std.log.debug("✅ BLAS-accelerated f64 matrix multiplication: {}x{} * {}x{}", .{ m, k, k, n });
+                        logDebug("✅ BLAS-accelerated f64 matrix multiplication: {}x{} * {}x{}", .{ m, k, k, n });
                     },
                     else => {
                         // Fallback to naive implementation for non-float types
@@ -331,7 +344,7 @@ pub fn Tensor(comptime dtype: TensorDType) type {
                 }
             }
 
-            std.log.debug("⚠️ Naive matrix multiplication used: {}x{} * {}x{}", .{ m, k, k, n });
+            logDebug("⚠️ Naive matrix multiplication used: {}x{} * {}x{}", .{ m, k, k, n });
         }
 
         /// Reshape tensor (must preserve total number of elements)
@@ -376,7 +389,7 @@ pub fn Tensor(comptime dtype: TensorDType) type {
 
         /// Print tensor information for debugging
         pub fn print(self: *const Self) void {
-            std.log.info("Tensor({}) shape: {any}, numel: {}, BLAS: {}", .{
+            logInfo("Tensor({}) shape: {any}, numel: {}, BLAS: {}", .{
                 dtype,
                 self.shape.dims,
                 self.shape.numel(),
@@ -407,7 +420,7 @@ pub fn benchmarkTensorOps(allocator: Allocator) !void {
     const size = 1024;
     const iterations = 10;
 
-    std.log.info("🚀 Benchmarking tensor operations ({}x{} matrices, {} iterations)...", .{ size, size, iterations });
+    logInfo("🚀 Benchmarking tensor operations ({}x{} matrices, {} iterations)...", .{ size, size, iterations });
 
     // Create test matrices
     var a = try createMatrix(.f32, allocator, size, size);
@@ -432,16 +445,16 @@ pub fn benchmarkTensorOps(allocator: Allocator) !void {
     const elapsed_s = @as(f64, @floatFromInt(elapsed_ns)) / 1e9;
     const gflops = ops / elapsed_s / 1e9;
 
-    std.log.info("✅ Matrix Multiplication Results:");
-    std.log.info("  Time: {d:.3} ms", .{elapsed_s * 1000.0});
-    std.log.info("  Performance: {d:.1} GFLOPS", .{gflops});
+    logInfo("✅ Matrix Multiplication Results:");
+    logInfo("  Time: {d:.3} ms", .{elapsed_s * 1000.0});
+    logInfo("  Performance: {d:.1} GFLOPS", .{gflops});
 
     if (a.blas_ctx) |blas_context| {
         const efficiency = gflops / blas_context.performance_info.peak_gflops * 100.0;
-        std.log.info("  Efficiency: {d:.1}% of peak BLAS performance", .{efficiency});
-        std.log.info("  BLAS Backend: {}", .{blas_context.backend});
+        logInfo("  Efficiency: {d:.1}% of peak BLAS performance", .{efficiency});
+        logInfo("  BLAS Backend: {}", .{blas_context.backend});
     } else {
-        std.log.info("  ⚠️ Using naive implementation (BLAS not available)");
+        logInfo("  ⚠️ Using naive implementation (BLAS not available)");
     }
 }
 

@@ -1,5 +1,7 @@
 # DeepZig V3 Implementation - Setup Guide
 
+> **Note**: See `/experimental/README.md` for more recent information. This file is not up to date.
+
 This guide will help you set up the development environment and understand the project structure.
 
 ## Prerequisites
@@ -125,7 +127,7 @@ zig build run
 zig build run -- --port 3000 --backend metal
 
 # With model path (when implemented)
-zig build run -- --model ./models/deepseek-v3.bin --backend cuda
+zig build run -- --model ./models/deepzig-v3.bin --backend cuda
 ```
 
 ### 4. Testing the API
@@ -141,7 +143,7 @@ curl http://localhost:8080/v1/models
 curl -X POST http://localhost:8080/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "deepseek-v3",
+    "model": "deepzig-v3",
     "messages": [{"role": "user", "content": "Hello!"}],
     "max_tokens": 100
   }'

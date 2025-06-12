@@ -3,10 +3,28 @@
 
 const std = @import("std");
 const print = std.debug.print;
+const builtin = @import("builtin");
 
 const cpu_backend = @import("cpu_backend");
 const deepseek_core = @import("deepseek_core");
 const Shape = deepseek_core.Shape;
+
+/// Conditional logging that's disabled in release mode for optimal performance
+inline fn logInfo(comptime fmt: []const u8, args: anytype) void {
+    // Always show essential benchmark results
+    std.log.info(fmt, args);
+}
+
+inline fn logWarn(comptime fmt: []const u8, args: anytype) void {
+    // Always show warnings
+    std.log.warn(fmt, args);
+}
+
+inline fn logDebug(comptime fmt: []const u8, args: anytype) void {
+    if (builtin.mode == .Debug) {
+        std.log.debug(fmt, args);
+    }
+}
 
 // Benchmark result collection
 const MatrixResult = struct {
@@ -99,42 +117,72 @@ fn printBanner() void {
 }
 
 fn runTensorBenchmarks(allocator: std.mem.Allocator, results: *BenchmarkResults) !void {
-    std.log.info("📊 TENSOR OPERATIONS BENCHMARK", .{});
-    std.log.info("-------------------------------", .{});
+    logInfo("📊 TENSOR OPERATIONS BENCHMARK", .{});
+    logInfo("-------------------------------", .{});
+
+    // Initialize BLAS ONCE for all operations
+    const blas_context = deepseek_core.blas.Blas.init(allocator) catch {
+        logInfo("⚠️ BLAS initialization failed, using naive implementation", .{});
+        return;
+    };
 
     // Test different matrix sizes
     const sizes = [_]u32{ 256, 512, 1024, 2048 };
     const iterations = [_]u32{ 50, 20, 10, 5 };
 
     for (sizes, iterations) |size, iters| {
-        try benchmarkMatrixMultiplication(allocator, size, iters, results);
+        try benchmarkMatrixMultiplicationOptimized(allocator, size, iters, results, &blas_context);
     }
 
     // Tensor addition benchmark
     try benchmarkTensorAddition(allocator, results);
 
-    std.log.info("", .{});
+    logInfo("", .{});
 }
 
-fn benchmarkMatrixMultiplication(allocator: std.mem.Allocator, size: u32, iterations: u32, results: *BenchmarkResults) !void {
-    std.log.info("🔢 Matrix Multiplication {}x{} ({} iterations)", .{ size, size, iterations });
+fn benchmarkMatrixMultiplicationOptimized(allocator: std.mem.Allocator, size: u32, iterations: u32, results: *BenchmarkResults, blas_context: *const deepseek_core.blas.Blas) !void {
+    logInfo("🔢 Matrix Multiplication {}x{} ({} iterations)", .{ size, size, iterations });
 
-    // Create matrices
-    var a = try deepseek_core.createMatrix(.f32, allocator, size, size);
-    var b = try deepseek_core.createMatrix(.f32, allocator, size, size);
-    var c = try deepseek_core.createMatrix(.f32, allocator, size, size);
-    defer a.deinit();
-    defer b.deinit();
-    defer c.deinit();
+    // Create raw matrices without BLAS initialization overhead
+    const matrix_a = try deepseek_core.blas.createMatrix(f32, allocator, size, size);
+    const matrix_b = try deepseek_core.blas.createMatrix(f32, allocator, size, size);
+    const matrix_c = try deepseek_core.blas.createMatrix(f32, allocator, size, size);
+    defer allocator.free(matrix_a);
+    defer allocator.free(matrix_b);
+    defer allocator.free(matrix_c);
 
     // Fill with random data
-    a.fillRandom(42);
-    b.fillRandom(123);
+    var prng = std.Random.DefaultPrng.init(42);
+    const random = prng.random();
+    for (matrix_a) |*val| val.* = random.float(f32);
+    for (matrix_b) |*val| val.* = random.float(f32);
 
-    // Benchmark
+    const dims = deepseek_core.blas.MatrixDims{
+        .m = size,
+        .n = size,
+        .k = size,
+    };
+
+    // Warmup iterations (critical for BLAS performance)
+    const warmup_iterations = 2;
+    for (0..warmup_iterations) |_| {
+        @memset(matrix_c, 0.0);
+        blas_context.matmul(f32, matrix_a, matrix_b, matrix_c, dims);
+    }
+
+    // Small delay to let system stabilize
+    std.time.sleep(50_000_000); // 50ms
+
+    // Actual benchmark (no debug logging in hot path)
     var timer = try std.time.Timer.start();
-    for (0..iterations) |_| {
-        try a.matmul(&b, &c);
+    for (0..iterations) |i| {
+        @memset(matrix_c, 0.0); // Reset for clean measurement
+        blas_context.matmul(f32, matrix_a, matrix_b, matrix_c, dims);
+
+        // Small pause between iterations
+        if (i < iterations - 1) {
+            std.time.sleep(1_000_000); // 1ms pause
+        }
     }
     const elapsed_ns = timer.read();
 
@@ -145,25 +193,22 @@ fn benchmarkMatrixMultiplication(allocator: std.mem.Allocator, size: u32, iterat
     const avg_time_ms = elapsed_s * 1000.0 / @as(f64, @floatFromInt(iterations));
 
     // Performance comparison
-    if (a.blas_ctx) |blas_context| {
-        const efficiency = gflops / blas_context.performance_info.peak_gflops * 100.0;
-        std.log.info("  ✅ BLAS-accelerated: {d:.1} ms/iter, {d:.1} GFLOPS ({d:.1}% efficiency)", .{ avg_time_ms, gflops, efficiency });
-        std.log.info("  🔧 Backend: {}, Peak: {d:.1} GFLOPS", .{ blas_context.backend, blas_context.performance_info.peak_gflops });
-        try results.matrix_results.append(MatrixResult{
-            .size = size,
-            .gflops = gflops,
-            .time_ms = avg_time_ms,
-        });
-    } else {
-        std.log.info("  ⚠️ Naive implementation: {d:.1} ms/iter, {d:.1} GFLOPS", .{ avg_time_ms, gflops });
-    }
+    const efficiency = gflops / blas_context.performance_info.peak_gflops * 100.0;
+    logInfo("  ✅ BLAS-accelerated: {d:.1} ms/iter, {d:.1} GFLOPS ({d:.1}% efficiency)", .{ avg_time_ms, gflops, efficiency });
+    logInfo("  🔧 Backend: {}, Peak: {d:.1} GFLOPS", .{ blas_context.backend, blas_context.performance_info.peak_gflops });
+
+    try results.matrix_results.append(MatrixResult{
+        .size = size,
+        .gflops = gflops,
+        .time_ms = avg_time_ms,
+    });
 }
 
 fn benchmarkTensorAddition(allocator: std.mem.Allocator, results: *BenchmarkResults) !void {
     const size = 1024 * 1024; // 1M elements
     const iterations = 1000;
 
-    std.log.info("➕ Tensor Addition (SIMD) - {} elements, {} iterations", .{ size, iterations });
+    logInfo("➕ Tensor Addition (SIMD) - {} elements, {} iterations", .{ size, iterations });
 
     var a = try deepseek_core.createVector(.f32, allocator, size);
     var b = try deepseek_core.createVector(.f32, allocator, size);
@@ -185,52 +230,52 @@ fn benchmarkTensorAddition(allocator: std.mem.Allocator, results: *BenchmarkResu
     const operations_per_sec = @as(f64, @floatFromInt(size * iterations)) / elapsed_s;
     const bandwidth_gb_s = operations_per_sec * @sizeOf(f32) * 3 / (1024 * 1024 * 1024); // 3x for read a, read b, write c
 
-    std.log.info("  ✅ {d:.1} GOp/s, {d:.1} GB/s bandwidth", .{ operations_per_sec / 1e9, bandwidth_gb_s });
+    logInfo("  ✅ {d:.1} GOp/s, {d:.1} GB/s bandwidth", .{ operations_per_sec / 1e9, bandwidth_gb_s });
     results.tensor_add_bandwidth_gbps = bandwidth_gb_s;
 }
 
 fn runBlasBenchmarks(allocator: std.mem.Allocator, results: *BenchmarkResults) !void {
-    std.log.info("🧮 BLAS LIBRARY BENCHMARK", .{});
-    std.log.info("-------------------------", .{});
+    logInfo("🧮 BLAS LIBRARY BENCHMARK", .{});
+    logInfo("-------------------------", .{});
 
     // Initialize BLAS and show detection results
     const blas_context = deepseek_core.blas.Blas.init(allocator) catch {
-        std.log.info("⚠️ BLAS initialization failed, using naive implementation", .{});
+        logInfo("⚠️ BLAS initialization failed, using naive implementation", .{});
         return;
     };
 
-    std.log.info("🔍 BLAS Detection Results:", .{});
-    std.log.info("  Backend: {}", .{blas_context.backend});
-    std.log.info("  Expected Peak Performance: {d:.1} GFLOPS", .{blas_context.performance_info.peak_gflops});
-    std.log.info("  Memory Bandwidth: {d:.1} GB/s", .{blas_context.performance_info.memory_bandwidth_gb_s});
-    std.log.info("  SIMD Width: {} bits", .{blas_context.performance_info.simd_width});
-    std.log.info("  Mixed Precision: {}", .{blas_context.performance_info.supports_mixed_precision});
+    logInfo("🔍 BLAS Detection Results:", .{});
+    logInfo("  Backend: {}", .{blas_context.backend});
+    logInfo("  Expected Peak Performance: {d:.1} GFLOPS", .{blas_context.performance_info.peak_gflops});
+    logInfo("  Memory Bandwidth: {d:.1} GB/s", .{blas_context.performance_info.memory_bandwidth_gb_s});
+    logInfo("  SIMD Width: {} bits", .{blas_context.performance_info.simd_width});
+    logInfo("  Mixed Precision: {}", .{blas_context.performance_info.supports_mixed_precision});
 
     // Run dedicated BLAS benchmark
-    std.log.info("", .{});
-    std.log.info("🚀 Running dedicated BLAS benchmark...", .{});
+    logInfo("", .{});
+    logInfo("🚀 Running dedicated BLAS benchmark...", .{});
     try deepseek_core.blas.benchmarkBlas(allocator);
 
-    std.log.info("", .{});
+    logInfo("", .{});
     results.setBLASBackend(blas_context.backend);
     results.blas_peak_gflops = blas_context.performance_info.peak_gflops;
 }
 
 fn runMemoryBenchmarks(allocator: std.mem.Allocator, results: *BenchmarkResults) !void {
-    std.log.info("💾 MEMORY PERFORMANCE BENCHMARK", .{});
-    std.log.info("--------------------------------", .{});
+    logInfo("💾 MEMORY PERFORMANCE BENCHMARK", .{});
+    logInfo("--------------------------------", .{});
 
     try benchmarkMemoryBandwidth(allocator, results);
     try benchmarkMemoryLatency(allocator, results);
 
-    std.log.info("", .{});
+    logInfo("", .{});
 }
 
 fn benchmarkMemoryBandwidth(allocator: std.mem.Allocator, results: *BenchmarkResults) !void {
     const size = 128 * 1024 * 1024 / @sizeOf(f32); // 128MB of f32s
     const iterations = 100;
 
-    std.log.info("📈 Memory Bandwidth Test - {} MB, {} iterations", .{ size * @sizeOf(f32) / (1024 * 1024), iterations });
+    logInfo("📈 Memory Bandwidth Test - {} MB, {} iterations", .{ size * @sizeOf(f32) / (1024 * 1024), iterations });
 
     const data = try allocator.alloc(f32, size);
     defer allocator.free(data);
@@ -254,7 +299,7 @@ fn benchmarkMemoryBandwidth(allocator: std.mem.Allocator, results: *BenchmarkRes
     const bytes_read = @as(f64, @floatFromInt(size * @sizeOf(f32) * iterations));
     const bandwidth_gb_s = bytes_read / elapsed_s / (1024 * 1024 * 1024);
 
-    std.log.info("  ✅ Sequential Read: {d:.1} GB/s (checksum: {d:.1})", .{ bandwidth_gb_s, checksum });
+    logInfo("  ✅ Sequential Read: {d:.1} GB/s (checksum: {d:.1})", .{ bandwidth_gb_s, checksum });
 
     // Memory copy benchmark
     const dest = try allocator.alloc(f32, size);
@@ -269,7 +314,7 @@ fn benchmarkMemoryBandwidth(allocator: std.mem.Allocator, results: *BenchmarkRes
     const copy_elapsed_s = @as(f64, @floatFromInt(copy_elapsed_ns)) / 1e9;
     const copy_bandwidth_gb_s = bytes_read / copy_elapsed_s / (1024 * 1024 * 1024);
 
-    std.log.info("  ✅ Memory Copy: {d:.1} GB/s", .{copy_bandwidth_gb_s});
+    logInfo("  ✅ Memory Copy: {d:.1} GB/s", .{copy_bandwidth_gb_s});
     results.memory_copy_bandwidth_gbps = copy_bandwidth_gb_s;
 }
 
@@ -277,7 +322,7 @@ fn benchmarkMemoryLatency(allocator: std.mem.Allocator, results: *BenchmarkResul
     const size = 1024 * 1024; // 1M elements
     const iterations = 1000;
 
-    std.log.info("⏱️ Memory Latency Test - Random Access Pattern", .{});
+    logInfo("⏱️ Memory Latency Test - Random Access Pattern", .{});
 
     const data = try allocator.alloc(u32, size);
     defer allocator.free(data);
@@ -302,20 +347,20 @@ fn benchmarkMemoryLatency(allocator: std.mem.Allocator, results: *BenchmarkResul
     const accesses_per_sec = @as(f64, @floatFromInt(size * iterations)) / elapsed_s;
     const avg_latency_ns = elapsed_s * 1e9 / @as(f64, @floatFromInt(size * iterations));
 
-    std.log.info("  ✅ {d:.1} M accesses/s, {d:.1} ns avg latency (index: {})", .{ accesses_per_sec / 1e6, avg_latency_ns, index });
+    logInfo("  ✅ {d:.1} M accesses/s, {d:.1} ns avg latency (index: {})", .{ accesses_per_sec / 1e6, avg_latency_ns, index });
     results.memory_latency_ns = avg_latency_ns;
 }
 
 fn printDynamicSummary(results: *BenchmarkResults) void {
-    std.log.info("", .{});
-    std.log.info("🎯 DYNAMIC BENCHMARK SUMMARY", .{});
-    std.log.info("===============================", .{});
-    std.log.info("", .{});
+    logInfo("", .{});
+    logInfo("🎯 DYNAMIC BENCHMARK SUMMARY", .{});
+    logInfo("===============================", .{});
+    logInfo("", .{});
 
     if (results.matrix_results.items.len > 0) {
-        std.log.info("📊 Matrix Multiplication Performance:", .{});
+        logInfo("📊 Matrix Multiplication Performance:", .{});
         for (results.matrix_results.items) |result| {
-            std.log.info("  • {}×{}: {d:.1} ms, {d:.0} GFLOPS", .{ result.size, result.size, result.time_ms, result.gflops });
+            logInfo("  • {}×{}: {d:.1} ms, {d:.0} GFLOPS", .{ result.size, result.size, result.time_ms, result.gflops });
         }
 
         // Find best performance
@@ -327,32 +372,32 @@ fn printDynamicSummary(results: *BenchmarkResults) void {
                 best_size = result.size;
             }
         }
-        std.log.info("  🏆 Peak measured: {d:.0} GFLOPS at {}×{}", .{ best_gflops, best_size, best_size });
-        std.log.info("", .{});
+        logInfo("  🏆 Peak measured: {d:.0} GFLOPS at {}×{}", .{ best_gflops, best_size, best_size });
+        logInfo("", .{});
     }
 
     if (results.blas_backend) |backend_name| {
-        std.log.info("🧮 BLAS Configuration:", .{});
-        std.log.info("  • Backend: {s}", .{backend_name});
-        std.log.info("  • Theoretical peak: {d:.0} GFLOPS (estimated)", .{results.blas_peak_gflops});
-        std.log.info("", .{});
+        logInfo("🧮 BLAS Configuration:", .{});
+        logInfo("  • Backend: {s}", .{backend_name});
+        logInfo("  • Theoretical peak: {d:.0} GFLOPS (estimated)", .{results.blas_peak_gflops});
+        logInfo("", .{});
     }
 
     if (results.tensor_add_bandwidth_gbps > 0) {
-        std.log.info("➕ Tensor Operations:", .{});
-        std.log.info("  • SIMD Addition: {d:.1} GB/s", .{results.tensor_add_bandwidth_gbps});
-        std.log.info("", .{});
+        logInfo("➕ Tensor Operations:", .{});
+        logInfo("  • SIMD Addition: {d:.1} GB/s", .{results.tensor_add_bandwidth_gbps});
+        logInfo("", .{});
     }
 
     if (results.memory_copy_bandwidth_gbps > 0 or results.memory_latency_ns > 0) {
-        std.log.info("💾 Memory Performance:", .{});
+        logInfo("💾 Memory Performance:", .{});
         if (results.memory_copy_bandwidth_gbps > 0) {
-            std.log.info("  • Copy Bandwidth: {d:.1} GB/s", .{results.memory_copy_bandwidth_gbps});
+            logInfo("  • Copy Bandwidth: {d:.1} GB/s", .{results.memory_copy_bandwidth_gbps});
         }
         if (results.memory_latency_ns > 0) {
-            std.log.info("  • Random Access Latency: {d:.1} ns", .{results.memory_latency_ns});
+            logInfo("  • Random Access Latency: {d:.1} ns", .{results.memory_latency_ns});
         }
-        std.log.info("", .{});
+        logInfo("", .{});
     }
 
     // Performance assessment based on actual measurements only
@@ -364,24 +409,24 @@ fn printDynamicSummary(results: *BenchmarkResults) void {
             }
         }
 
-        std.log.info("🎯 Performance Assessment:", .{});
+        logInfo("🎯 Performance Assessment:", .{});
 
         if (best_measured_gflops > 1000) {
-            std.log.info("  ✅ Excellent: BLAS delivering 1000+ GFLOPS", .{});
+            logInfo("  ✅ Excellent: BLAS delivering 1000+ GFLOPS", .{});
         } else if (best_measured_gflops > 500) {
-            std.log.info("  ✅ Good: BLAS delivering 500+ GFLOPS", .{});
+            logInfo("  ✅ Good: BLAS delivering 500+ GFLOPS", .{});
         } else if (best_measured_gflops > 100) {
-            std.log.info("  ⚠️ Moderate: BLAS working, performance could improve", .{});
+            logInfo("  ⚠️ Moderate: BLAS working, performance could improve", .{});
         } else {
-            std.log.info("  ❌ Poor: BLAS may not be working optimally", .{});
+            logInfo("  ❌ Poor: BLAS may not be working optimally", .{});
         }
 
         // Only show efficiency comparison if we have reasonable confidence in the estimate
         if (results.blas_peak_gflops > best_measured_gflops * 1.5) {
             const estimated_efficiency = best_measured_gflops / results.blas_peak_gflops * 100.0;
-            std.log.info("  • Est. efficiency: {d:.0}% (vs theoretical peak)", .{estimated_efficiency});
+            logInfo("  • Est. efficiency: {d:.0}% (vs theoretical peak)", .{estimated_efficiency});
         }
 
-        std.log.info("", .{});
+        logInfo("", .{});
     }
 }

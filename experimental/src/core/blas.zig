@@ -15,6 +15,18 @@ const Allocator = std.mem.Allocator;
 const Random = std.Random;
 const builtin = @import("builtin");
 
+/// Conditional logging that's disabled in release mode for optimal performance
+inline fn logInfo(comptime fmt: []const u8, args: anytype) void {
+    // Always show essential benchmark results
+    std.log.info(fmt, args);
+}
+
+inline fn logDebug(comptime fmt: []const u8, args: anytype) void {
+    if (builtin.mode == .Debug) {
+        std.log.debug(fmt, args);
+    }
+}
+
 /// Simple Apple Silicon detection for BLAS optimization
 fn isAppleSilicon() bool {
     return builtin.os.tag == .macos and builtin.target.cpu.arch == .aarch64;
@@ -214,11 +226,8 @@ pub const Blas = struct {
         const backend = BlasBackend.detectOptimal(allocator);
         const performance_info = backend.getPerformanceInfo(allocator);
 
-        std.log.info("BLAS initialized with {} backend", .{backend});
-        std.log.info("Expected performance: {d:.1} GFLOPS, {d:.1} GB/s bandwidth", .{
-            performance_info.peak_gflops,
-            performance_info.memory_bandwidth_gb_s,
-        });
+        // Minimal logging for debugging
+        logDebug("BLAS initialized with {} backend", .{backend});
 
         return Blas{
             .backend = backend,
@@ -406,8 +415,9 @@ pub fn createMatrix(comptime T: type, allocator: Allocator, rows: usize, cols: u
 pub fn benchmarkBlas(allocator: Allocator) !void {
     const size = 1024;
     const iterations = 10;
+    const warmup_iterations = 2;
 
-    std.log.info("🚀 Benchmarking BLAS operations ({}x{} matrices, {} iterations)...", .{ size, size, iterations });
+    logInfo("🚀 Benchmarking BLAS operations ({}x{} matrices, {} iterations)...", .{ size, size, iterations });
 
     // Initialize BLAS
     const blas = try Blas.init(allocator);
@@ -427,10 +437,26 @@ pub fn benchmarkBlas(allocator: Allocator) !void {
     for (matrix_b) |*val| val.* = random.float(f32);
     @memset(matrix_c, 0.0);
 
+    // Warmup runs to stabilize performance
+    for (0..warmup_iterations) |w| {
+        _ = w; // Mark unused
+        blas.matmul(f32, matrix_a, matrix_b, matrix_c, .{ .m = size, .n = size, .k = size });
+        @memset(matrix_c, 0.0); // Reset for next iteration
+    }
+
+    // Small delay to let system stabilize
+    std.time.sleep(100_000_000); // 100ms
+
     // Benchmark matrix multiplication
     var timer = try std.time.Timer.start();
-    for (0..iterations) |_| {
+    for (0..iterations) |i| {
         blas.matmul(f32, matrix_a, matrix_b, matrix_c, .{ .m = size, .n = size, .k = size });
+        @memset(matrix_c, 0.0); // Reset for next iteration
+
+        // Small pause between iterations to prevent system pressure
+        if (i < iterations - 1) {
+            std.time.sleep(1_000_000); // 1ms pause
+        }
     }
     const elapsed_ns = timer.read();
 
@@ -438,13 +464,17 @@ pub fn benchmarkBlas(allocator: Allocator) !void {
     const elapsed_s = @as(f64, @floatFromInt(elapsed_ns)) / 1e9;
     const gflops = ops / elapsed_s / 1e9;
 
-    std.log.info("✅ BLAS Matrix Multiplication Results:", .{});
-    std.log.info("  Time: {d:.3} ms", .{elapsed_s * 1000.0});
-    std.log.info("  Performance: {d:.1} GFLOPS", .{gflops});
-    std.log.info("  Backend: {}", .{blas.backend});
+    logInfo("✅ BLAS Matrix Multiplication Results:", .{});
+    logInfo("  Time: {d:.3} ms", .{elapsed_s * 1000.0});
+    logInfo("  Performance: {d:.1} GFLOPS", .{gflops});
+    logInfo("  Backend: {}", .{blas.backend});
 
     const efficiency = gflops / blas.performance_info.peak_gflops * 100.0;
-    std.log.info("  Efficiency: {d:.1}% of peak BLAS performance", .{efficiency});
+    logInfo("  Efficiency: {d:.1}% of peak BLAS performance", .{efficiency});
+
+    // Additional system info for debugging
+    logInfo("  Matrix size: {}x{}, {} total operations", .{ size, size, @as(u64, @intCast(iterations)) });
+    logInfo("  Average time per iteration: {d:.3} ms", .{elapsed_s * 1000.0 / @as(f64, @floatFromInt(iterations))});
 }
 
 // Basic tests
