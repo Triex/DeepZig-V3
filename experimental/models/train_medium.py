@@ -936,9 +936,9 @@ def main():
     print("🏃 Starting training...")
     trainer.train()
 
-    # 10. Save model
+    # 10. Save model with safe serialization disabled for tied weights
     print("💾 Saving model...")
-    trainer.save_model()
+    trainer.save_model(safe_serialization=False)
 
     # 11. Export to Zig format
     export_to_zig_format(model, tokenizer, args.output_dir)
