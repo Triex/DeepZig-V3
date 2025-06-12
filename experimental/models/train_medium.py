@@ -1,634 +1,955 @@
-# # Create a venv with HF tooling
-# python -m venv .venv && source .venv/bin/activate
-# pip install torch transformers datasets safetensors accelerate tokenizers
+#!/usr/bin/env python3
+"""
+DeepZig Conversational Model Training Script
+===========================================
 
-# python train_medium.py        # (script below)
-# zig build run -- --medium --model models/deepzig-medium-demo --no-server
+A reference implementation for training small, efficient conversational language models
+following 2024-2025 best practices. This script creates a DeepZig model optimized for:
 
-from transformers import PretrainedConfig, PreTrainedModel, TrainingArguments, Trainer
-from transformers.modeling_outputs import CausalLMOutput
-import torch, torch.nn as nn, torch.nn.functional as F
-from datasets import load_dataset
-from tokenizers import Tokenizer, models, pre_tokenizers, trainers, processors
-import json, os
+- Fast inference on edge devices
+- Tool calling and system prompt understanding
+- Efficient memory usage with optional LoRA fine-tuning
+- High-quality conversational capabilities
 
-# 1. Build a generic HF Config that will happily accept DeepZig-specific keys
-cfg_dict = dict(
-    model_type         = "deepzig_v3",
-    architectures      = ["DeepZigMediumLM"],
-    vocab_size         = 32_000,
-    hidden_size        = 768,
-    intermediate_size  = 2_048,
-    num_hidden_layers  = 12,
-    num_key_value_heads= 12,
-    num_attention_heads= 12,
-    max_position_embeddings = 2_048,
-    qk_nope_head_dim   = 32,
-    qk_rope_head_dim   = 32,
-    v_head_dim         = 64,
-    qk_rope_base       = 10_000.0,
-    num_experts        = 8,
-    num_experts_per_token = 2,
-    moe_layer_freq     = 2,
-    first_k_dense_replace = 1,
-    moe_intermediate_size = 2_048,
-    bos_token_id       = 1,
-    eos_token_id       = 2,
-    rms_norm_eps       = 1e-6,
-    temperature        = 0.8,
-    top_p              = 0.9,
-    top_k              = 40,
-    torch_dtype        = "float32"
+Key Features:
+- RoPE (Rotary Position Embeddings) for better positional understanding
+- RMS normalization for training stability
+- Optimized small model architecture (512 hidden, 8 layers)
+- High-quality conversational datasets with tool-calling examples
+- Optional LoRA fine-tuning for parameter efficiency
+- Proper generation configuration to eliminate warnings
+- Zig-compatible safetensors export
+
+Usage:
+    python train_medium.py [--use-lora] [--eval-split 0.1] [--max-samples 20000]
+
+Requirements:
+    pip install torch transformers datasets safetensors accelerate tokenizers peft
+"""
+
+import argparse
+import json
+import os
+import warnings
+from typing import Dict, List, Optional, Union, Tuple
+import math
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader
+from torch.utils.checkpoint import checkpoint
+
+from transformers import (
+    PretrainedConfig, PreTrainedModel, TrainingArguments, Trainer,
+    GenerationConfig, TrainerCallback
 )
-config = PretrainedConfig.from_dict(cfg_dict)
+from transformers.modeling_outputs import CausalLMOutput
+from datasets import load_dataset, concatenate_datasets, Dataset
+from tokenizers import Tokenizer, models, pre_tokenizers, trainers, processors
+from safetensors.numpy import save_file
 
-# 2. Define a medium causal-LM that matches the config dimensions and Zig engine expectations
-class DeepZigMediumLM(PreTrainedModel):
-    config_class = PretrainedConfig
-    def __init__(self, cfg):
-        super().__init__(cfg)
-        self.embed = nn.Embedding(cfg.vocab_size, cfg.hidden_size)
+# Optional LoRA support
+try:
+    from peft import LoraConfig, get_peft_model, TaskType
+    PEFT_AVAILABLE = True
+except ImportError:
+    PEFT_AVAILABLE = False
+    warnings.warn("PEFT not available. Install with: pip install peft")
 
-        # Create transformer layers with attention and MLP blocks
-        self.layers = nn.ModuleList([])
-        for i in range(cfg.num_hidden_layers):
-            # Create a layer with attention and MLP
-            layer = nn.ModuleDict({
-                # Self-attention block
-                'attention': nn.ModuleDict({
-                    'q_proj': nn.Linear(cfg.hidden_size, cfg.num_attention_heads * cfg.qk_rope_head_dim),
-                    'k_proj': nn.Linear(cfg.hidden_size, cfg.num_key_value_heads * cfg.qk_rope_head_dim),
-                    'v_proj': nn.Linear(cfg.hidden_size, cfg.num_key_value_heads * cfg.v_head_dim),
-                    'o_proj': nn.Linear(cfg.num_attention_heads * cfg.v_head_dim, cfg.hidden_size),
-                    'norm': nn.LayerNorm(cfg.hidden_size, eps=cfg.rms_norm_eps),
-                }),
 
-                # MLP block (with MoE for some layers)
-                'mlp': nn.ModuleDict({
-                    'norm': nn.LayerNorm(cfg.hidden_size, eps=cfg.rms_norm_eps),
-                })
-            })
+# =============================================================================
+# Model Configuration
+# =============================================================================
 
-            # Add MLP components based on whether this is an MoE layer
-            if i >= cfg.first_k_dense_replace and i % cfg.moe_layer_freq == 0:
-                # MoE layer
-                layer['mlp']['experts'] = nn.ModuleList([
-                    nn.ModuleDict({
-                        'gate_proj': nn.Linear(cfg.hidden_size, cfg.moe_intermediate_size),
-                        'down_proj': nn.Linear(cfg.moe_intermediate_size, cfg.hidden_size)
-                    }) for _ in range(cfg.num_experts)
-                ])
-                layer['mlp']['router'] = nn.Linear(cfg.hidden_size, cfg.num_experts)
-            else:
-                # Standard MLP
-                layer['mlp']['gate_proj'] = nn.Linear(cfg.hidden_size, cfg.intermediate_size)
-                layer['mlp']['down_proj'] = nn.Linear(cfg.intermediate_size, cfg.hidden_size)
+class DeepZigConfig(PretrainedConfig):
+    """Optimized configuration for small conversational language models."""
 
-            self.layers.append(layer)
+    model_type = "deepzig_conversational"
 
-        # Final layer norm
-        self.norm = nn.LayerNorm(cfg.hidden_size, eps=cfg.rms_norm_eps)
+    def __init__(
+        self,
+        vocab_size: int = 32_000,
+        hidden_size: int = 512,          # Optimized for efficiency
+        intermediate_size: int = 1536,   # 3x hidden_size ratio
+        num_hidden_layers: int = 8,      # Reduced for faster inference
+        num_attention_heads: int = 8,
+        num_key_value_heads: int = 8,    # Full attention for better quality
+        max_position_embeddings: int = 4096,  # Support longer conversations
+        rope_base: float = 10_000.0,          # RoPE base frequency
+        rope_scaling: Optional[Dict] = None,  # For sequence length extension
+        rms_norm_eps: float = 1e-6,
+        attention_dropout: float = 0.0,
+        hidden_dropout: float = 0.0,
+        torch_dtype: str = "bfloat16",
+        use_cache: bool = True,
+        tie_word_embeddings: bool = True,     # Explicitly declare tied weights
+        pad_token_id: int = 0,
+        bos_token_id: int = 1,
+        eos_token_id: int = 2,
+        **kwargs
+    ):
+        super().__init__(
+            pad_token_id=pad_token_id,
+            bos_token_id=bos_token_id,
+            eos_token_id=eos_token_id,
+            tie_word_embeddings=tie_word_embeddings,
+            **kwargs
+        )
 
-        # LM head
-        self.lm_head = nn.Linear(cfg.hidden_size, cfg.vocab_size, bias=False)
+        self.vocab_size = vocab_size
+        self.hidden_size = hidden_size
+        self.intermediate_size = intermediate_size
+        self.num_hidden_layers = num_hidden_layers
+        self.num_attention_heads = num_attention_heads
+        self.num_key_value_heads = num_key_value_heads
+        self.max_position_embeddings = max_position_embeddings
+        self.rope_base = rope_base
+        self.rope_scaling = rope_scaling
+        self.rms_norm_eps = rms_norm_eps
+        self.attention_dropout = attention_dropout
+        self.hidden_dropout = hidden_dropout
+        self.torch_dtype = torch_dtype
+        self.use_cache = use_cache
+        self.tie_word_embeddings = tie_word_embeddings
 
-        # Initialize weights
+
+# =============================================================================
+# RoPE (Rotary Position Embedding) Implementation
+# =============================================================================
+
+class RotaryEmbedding(nn.Module):
+    """
+    Efficient Rotary Position Embedding implementation.
+
+    RoPE provides better positional understanding than absolute position embeddings,
+    crucial for conversational models that need to understand context relationships.
+    """
+
+    def __init__(self, dim: int, max_position_embeddings: int = 4096, base: float = 10000.0):
+        super().__init__()
+        self.dim = dim
+        self.max_position_embeddings = max_position_embeddings
+        self.base = base
+
+        # Precompute frequency tensor
+        inv_freq = 1.0 / (self.base ** (torch.arange(0, self.dim, 2).float() / self.dim))
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+
+    def forward(self, x: torch.Tensor, seq_len: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Generate cos and sin embeddings for the given sequence length."""
+        t = torch.arange(seq_len, device=x.device).type_as(self.inv_freq)
+        freqs = torch.outer(t, self.inv_freq)
+        emb = torch.cat((freqs, freqs), dim=-1)
+        return emb.cos().to(x.dtype), emb.sin().to(x.dtype)
+
+
+def apply_rotary_pos_emb(q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Apply rotary position embeddings to query and key tensors."""
+    def rotate_half(x):
+        x1, x2 = x[..., :x.shape[-1] // 2], x[..., x.shape[-1] // 2:]
+        return torch.cat((-x2, x1), dim=-1)
+
+    q_embed = (q * cos) + (rotate_half(q) * sin)
+    k_embed = (k * cos) + (rotate_half(k) * sin)
+    return q_embed, k_embed
+
+
+# =============================================================================
+# RMS Normalization
+# =============================================================================
+
+class RMSNorm(nn.Module):
+    """
+    Root Mean Square Layer Normalization.
+
+    RMSNorm is more stable and efficient than LayerNorm for language models,
+    providing better training dynamics and faster inference.
+    """
+
+    def __init__(self, hidden_size: int, eps: float = 1e-6):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(hidden_size))
+        self.variance_epsilon = eps
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        variance = hidden_states.pow(2).mean(-1, keepdim=True)
+        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
+        return self.weight * hidden_states
+
+
+# =============================================================================
+# Attention Module with RoPE
+# =============================================================================
+
+class DeepZigAttention(nn.Module):
+    """
+    Multi-head attention with RoPE and optimizations for conversational models.
+    """
+
+    def __init__(self, config: DeepZigConfig):
+        super().__init__()
+        self.config = config
+        self.hidden_size = config.hidden_size
+        self.num_heads = config.num_attention_heads
+        self.head_dim = self.hidden_size // self.num_heads
+        self.num_key_value_heads = config.num_key_value_heads
+        self.num_key_value_groups = self.num_heads // self.num_key_value_heads
+
+        if self.hidden_size % self.num_heads != 0:
+            raise ValueError(f"hidden_size {self.hidden_size} not divisible by num_heads {self.num_heads}")
+
+        # Linear projections
+        self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=False)
+        self.k_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
+        self.v_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
+        self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
+
+        # RoPE
+        self.rotary_emb = RotaryEmbedding(
+            self.head_dim,
+            max_position_embeddings=config.max_position_embeddings,
+            base=config.rope_base
+        )
+
+        # Dropout
+        self.attention_dropout = nn.Dropout(config.attention_dropout)
+
+    def forward(self, hidden_states: torch.Tensor, attention_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        batch_size, seq_length, _ = hidden_states.shape
+
+        # Linear projections
+        query_states = self.q_proj(hidden_states)
+        key_states = self.k_proj(hidden_states)
+        value_states = self.v_proj(hidden_states)
+
+        # Reshape for multi-head attention
+        query_states = query_states.view(batch_size, seq_length, self.num_heads, self.head_dim).transpose(1, 2)
+        key_states = key_states.view(batch_size, seq_length, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+        value_states = value_states.view(batch_size, seq_length, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+
+        # Apply RoPE
+        cos, sin = self.rotary_emb(value_states, seq_len=seq_length)
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+
+        # Expand key/value states for grouped query attention
+        if self.num_key_value_groups > 1:
+            key_states = key_states.unsqueeze(2).expand(-1, -1, self.num_key_value_groups, -1, -1).reshape(
+                batch_size, self.num_heads, seq_length, self.head_dim
+            )
+            value_states = value_states.unsqueeze(2).expand(-1, -1, self.num_key_value_groups, -1, -1).reshape(
+                batch_size, self.num_heads, seq_length, self.head_dim
+            )
+
+        # Scaled dot-product attention
+        attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
+
+        # Apply causal mask
+        if attention_mask is not None:
+            attn_weights = attn_weights + attention_mask
+
+        # Causal mask for autoregressive generation
+        causal_mask = torch.triu(torch.ones((seq_length, seq_length), dtype=torch.bool, device=hidden_states.device), diagonal=1)
+        attn_weights = attn_weights.masked_fill(causal_mask.unsqueeze(0).unsqueeze(0), float('-inf'))
+
+        attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+        attn_weights = self.attention_dropout(attn_weights)
+
+        # Apply attention to values
+        attn_output = torch.matmul(attn_weights, value_states)
+
+        # Reshape and project
+        attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_length, self.hidden_size)
+        attn_output = self.o_proj(attn_output)
+
+        return attn_output
+
+
+# =============================================================================
+# Feed-Forward Network
+# =============================================================================
+
+class DeepZigMLP(nn.Module):
+    """
+    Optimized feed-forward network with SwiGLU activation.
+
+    SwiGLU provides better performance than standard ReLU/GELU for language models.
+    """
+
+    def __init__(self, config: DeepZigConfig):
+        super().__init__()
+        self.hidden_size = config.hidden_size
+        self.intermediate_size = config.intermediate_size
+
+        self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
+        self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
+        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
+        self.dropout = nn.Dropout(config.hidden_dropout)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        gate = F.silu(self.gate_proj(x))  # SwiGLU activation
+        up = self.up_proj(x)
+        return self.dropout(self.down_proj(gate * up))
+
+
+# =============================================================================
+# Transformer Layer
+# =============================================================================
+
+class DeepZigLayer(nn.Module):
+    """Single transformer layer with attention and feed-forward components."""
+
+    def __init__(self, config: DeepZigConfig):
+        super().__init__()
+        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.self_attn = DeepZigAttention(config)
+        self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.mlp = DeepZigMLP(config)
+
+    def forward(self, hidden_states: torch.Tensor, attention_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        # Self-attention with residual connection
+        residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
+        hidden_states = self.self_attn(hidden_states, attention_mask)
+        hidden_states = residual + hidden_states
+
+        # Feed-forward with residual connection
+        residual = hidden_states
+        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = self.mlp(hidden_states)
+        hidden_states = residual + hidden_states
+
+        return hidden_states
+
+
+# =============================================================================
+# Main Model
+# =============================================================================
+
+class DeepZigConversationalModel(PreTrainedModel):
+    """
+    DeepZig Conversational Language Model
+
+    A small, efficient transformer model optimized for conversational AI tasks,
+    tool calling, and system prompt understanding.
+    """
+
+    config_class = DeepZigConfig
+
+    def __init__(self, config: DeepZigConfig):
+        super().__init__(config)
+        self.config = config
+        self.gradient_checkpointing = False
+
+        # Embeddings
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
+
+        # Transformer layers
+        self.layers = nn.ModuleList([DeepZigLayer(config) for _ in range(config.num_hidden_layers)])
+
+        # Final normalization
+        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+        # Language modeling head
+        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+
+        # Initialize weights first
         self.apply(self._init_weights)
 
-        # Tie weights
-        self.lm_head.weight = self.embed.weight
+        # Tie weights between embedding and lm_head for parameter efficiency
+        self.tie_weights()
 
     def _init_weights(self, module):
+        """Initialize weights following best practices for small language models."""
         if isinstance(module, nn.Linear):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
             if module.bias is not None:
                 torch.nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
-        elif isinstance(module, nn.LayerNorm):
-            torch.nn.init.ones_(module.weight)
-            if module.bias is not None:
-                torch.nn.init.zeros_(module.bias)
 
-    def forward(self, input_ids, labels=None, attention_mask=None, **kwargs):
-        # Get embeddings
-        hidden_states = self.embed(input_ids)
-        batch_size, seq_length = input_ids.shape
+    def get_input_embeddings(self):
+        return self.embed_tokens
 
-        # Create causal mask for self-attention
-        causal_mask = torch.triu(torch.ones((seq_length, seq_length), dtype=torch.bool, device=input_ids.device), diagonal=1)
-        causal_mask = causal_mask.unsqueeze(0).unsqueeze(0)  # [1, 1, seq_length, seq_length]
+    def set_input_embeddings(self, value):
+        self.embed_tokens = value
 
-        # Process through transformer layers
+    def get_output_embeddings(self):
+        return self.lm_head
+
+    def set_output_embeddings(self, new_embeddings):
+        self.lm_head = new_embeddings
+
+    def tie_weights(self):
+        """Tie the weights between the input embeddings and the output embeddings."""
+        self.lm_head.weight = self.embed_tokens.weight
+
+    def _set_gradient_checkpointing(self, module, value=False):
+        """Enable or disable gradient checkpointing for the model."""
+        if isinstance(module, DeepZigConversationalModel):
+            module.gradient_checkpointing = value
+        # Also set it for transformer layers
         for layer in self.layers:
-            # Self-attention block with residual connection
-            residual = hidden_states
-            hidden_states = layer['attention']['norm'](hidden_states)
+            if hasattr(layer, 'gradient_checkpointing'):
+                layer.gradient_checkpointing = value
 
-            # Compute QKV projections
-            q = layer['attention']['q_proj'](hidden_states)
-            k = layer['attention']['k_proj'](hidden_states)
-            v = layer['attention']['v_proj'](hidden_states)
+    def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs=None):
+        """Enable gradient checkpointing for the model."""
+        if not hasattr(self, 'gradient_checkpointing'):
+            self.gradient_checkpointing = True
+        else:
+            self.gradient_checkpointing = True
 
-            # Reshape for attention computation
-            head_dim_q = self.config.qk_rope_head_dim
-            head_dim_v = self.config.v_head_dim
-            num_heads = self.config.num_attention_heads
-            num_kv_heads = self.config.num_key_value_heads
+    def gradient_checkpointing_disable(self):
+        """Disable gradient checkpointing for the model."""
+        if hasattr(self, 'gradient_checkpointing'):
+            self.gradient_checkpointing = False
 
-            q = q.view(batch_size, seq_length, num_heads, head_dim_q).transpose(1, 2)  # [batch, heads, seq, head_dim]
-            k = k.view(batch_size, seq_length, num_kv_heads, head_dim_q).transpose(1, 2)  # [batch, heads, seq, head_dim]
-            v = v.view(batch_size, seq_length, num_kv_heads, head_dim_v).transpose(1, 2)  # [batch, heads, seq, head_dim]
+    def forward(
+        self,
+        input_ids: torch.LongTensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        labels: Optional[torch.LongTensor] = None,
+        **kwargs
+    ) -> CausalLMOutput:
 
-            # Compute attention scores and mask
-            attn_weights = torch.matmul(q, k.transpose(-2, -1)) / (head_dim_q ** 0.5)
-            attn_weights = attn_weights.masked_fill(causal_mask, float('-inf'))
+        # Get embeddings
+        hidden_states = self.embed_tokens(input_ids)
 
-            # Apply attention mask if provided
-            if attention_mask is not None:
-                # Expand attention_mask to match attn_weights dimensions
-                expanded_mask = attention_mask.unsqueeze(1).unsqueeze(2)  # [batch, 1, 1, seq]
-                expanded_mask = (1.0 - expanded_mask) * -10000.0  # Convert 0s to large negative values
-                attn_weights = attn_weights + expanded_mask
+        # Create attention mask if not provided
+        if attention_mask is not None:
+            # Convert attention mask to bias format
+            batch_size, seq_length = input_ids.shape
+            attention_mask = (1.0 - attention_mask.unsqueeze(1).unsqueeze(2)) * -10000.0
 
-            # Compute attention probabilities and weighted sum
-            attn_weights = F.softmax(attn_weights, dim=-1)
-            attn_output = torch.matmul(attn_weights, v)  # [batch, heads, seq, head_dim]
+        # Pass through transformer layers
+        for layer in self.layers:
+            if self.gradient_checkpointing and self.training:
+                # Use gradient checkpointing for memory efficiency during training
+                def create_custom_forward(module):
+                    def custom_forward(*inputs):
+                        return module(*inputs)
+                    return custom_forward
 
-            # Reshape and project back
-            attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_length, -1)
-            hidden_states = residual + layer['attention']['o_proj'](attn_output)
-
-            # MLP block with residual connection
-            residual = hidden_states
-            hidden_states = layer['mlp']['norm'](hidden_states)
-
-            # Process through MLP (either standard or MoE)
-            if 'experts' in layer['mlp']:
-                # MoE layer
-                router_logits = layer['mlp']['router'](hidden_states)  # [batch, seq, num_experts]
-                routing_weights = F.softmax(router_logits, dim=-1)
-
-                # Get top-2 experts
-                top_k = min(2, len(layer['mlp']['experts']))  # Use top-2 experts
-                _, indices = torch.topk(routing_weights, top_k, dim=-1)  # [batch, seq, top_k]
-
-                # Process through selected experts
-                expert_outputs = torch.zeros_like(hidden_states)
-                for b in range(batch_size):
-                    for s in range(seq_length):
-                        for k in range(top_k):
-                            expert_idx = indices[b, s, k].item()
-                            expert = layer['mlp']['experts'][expert_idx]
-                            weight = routing_weights[b, s, expert_idx]
-
-                            # Apply expert
-                            expert_input = hidden_states[b, s].unsqueeze(0)  # [1, hidden]
-                            gate_output = F.gelu(expert['gate_proj'](expert_input))
-                            expert_output = expert['down_proj'](gate_output)
-                            expert_outputs[b, s] += weight * expert_output.squeeze(0)
-
-                hidden_states = residual + expert_outputs
+                hidden_states = checkpoint(
+                    create_custom_forward(layer),
+                    hidden_states,
+                    attention_mask,
+                    use_reentrant=False
+                )
             else:
-                # Standard MLP
-                gate_output = F.gelu(layer['mlp']['gate_proj'](hidden_states))
-                mlp_output = layer['mlp']['down_proj'](gate_output)
-                hidden_states = residual + mlp_output
+                hidden_states = layer(hidden_states, attention_mask)
 
-        # Apply final layer norm
+        # Final normalization
         hidden_states = self.norm(hidden_states)
 
-        # Get logits
+        # Language modeling logits
         logits = self.lm_head(hidden_states)
 
+        # Calculate loss if labels provided
         loss = None
         if labels is not None:
-            # Shift so that tokens < n predict n
+            # Shift labels for causal language modeling
             shift_logits = logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
 
-            # Flatten the tokens
+            # Calculate cross-entropy loss
             loss_fct = nn.CrossEntropyLoss(ignore_index=-100)
             loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
 
         return CausalLMOutput(
             loss=loss,
             logits=logits,
-            hidden_states=hidden_states
+            hidden_states=hidden_states,
         )
 
-model = DeepZigMediumLM(config)
 
-# 3. Load and prepare the dataset
-print("Loading dataset...")
-ds_full = load_dataset("wikitext", "wikitext-2-raw-v1", split="train")
+# =============================================================================
+# Data Processing
+# =============================================================================
 
-# Use a larger subset of the dataset for better training
-ds = ds_full.select(range(min(10000, len(ds_full))))
-print(f"Using {len(ds)} samples from {len(ds_full)} total")
+class ConversationalDataProcessor:
+    """Handles loading and processing of conversational datasets with tool calling support."""
 
-# Filter out very short texts
-ds = ds.filter(lambda example: len(example["text"]) > 100)
-print(f"After filtering: {len(ds)} samples")
+    SPECIAL_TOKENS = [
+        "<unk>", "<s>", "</s>", "<pad>",
+        "<user>", "</user>", "<assistant>", "</assistant>",
+        "<system>", "</system>", "<tool>", "</tool>"
+    ]
 
-# Create and train tokenizer first so we can use it for tokenization
-print("Creating and training tokenizer...")
-def create_tokenizer():
-    # Create a basic BPE tokenizer
-    tokenizer = Tokenizer(models.BPE())
+    @staticmethod
+    def load_datasets(max_samples: int = 20000) -> Dataset:
+        """Load and combine high-quality conversational datasets."""
+        datasets_to_load = [
+            ("databricks/databricks-dolly-15k", "train"),
+            ("tatsu-lab/alpaca", "train"),
+            ("sahil2801/CodeAlpaca-20k", "train"),
+        ]
 
-    # Add pre-tokenization (split on whitespace and punctuation)
-    tokenizer.pre_tokenizer = pre_tokenizers.Sequence([
-        pre_tokenizers.WhitespaceSplit(),
-        pre_tokenizers.Punctuation()
-    ])
+        all_datasets = []
+        for dataset_name, split in datasets_to_load:
+            try:
+                print(f"📚 Loading {dataset_name}...")
+                ds = load_dataset(dataset_name, split=split)
+                all_datasets.append(ds)
+                print(f"✅ Loaded {len(ds):,} examples from {dataset_name}")
+            except Exception as e:
+                print(f"⚠️ Failed to load {dataset_name}: {e}")
 
-    # Train on a sample of text
-    trainer = trainers.BpeTrainer(
-        vocab_size=cfg_dict["vocab_size"],
-        special_tokens=["<unk>", "<s>", "</s>", "<pad>", "<mask>"]
-    )
+        if not all_datasets:
+            raise ValueError("Failed to load any datasets")
 
-    # Use a larger sample of the dataset for tokenizer training
-    files = ["tokenizer_training_data.txt"]
-    with open(files[0], "w") as f:
-        for i in range(min(20000, len(ds_full))):
-            f.write(ds_full[i]["text"] + "\n")
+        # Combine datasets
+        combined_dataset = concatenate_datasets(all_datasets)
 
-    tokenizer.train(files, trainer)
+        # Add synthetic tool-calling examples
+        tool_examples = ConversationalDataProcessor._create_tool_examples()
+        tool_dataset = Dataset.from_list(tool_examples)
+        combined_dataset = concatenate_datasets([combined_dataset, tool_dataset])
 
-    # Add post-processing
-    tokenizer.post_processor = processors.TemplateProcessing(
-        single="<s> $A </s>",
-        pair="<s> $A </s> $B </s>",
-        special_tokens=[
-            ("<s>", 1),
-            ("</s>", 2),
-        ],
-    )
+        # Sample subset for training
+        max_samples = min(max_samples, len(combined_dataset))
+        dataset = combined_dataset.select(range(max_samples))
 
-    return tokenizer
+        print(f"📊 Using {len(dataset):,} training examples")
+        return dataset
 
-# Create tokenizer
-tokenizer = create_tokenizer()
-out_dir = "deepzig-medium-demo"
-os.makedirs(out_dir, exist_ok=True)
-tokenizer.save(f"{out_dir}/tokenizer.json")
-print("✅ Saved tokenizer to", f"{out_dir}/tokenizer.json")
+    @staticmethod
+    def _create_tool_examples() -> List[Dict]:
+        """Create synthetic examples for tool calling training."""
+        return [
+            {
+                "instruction": "What's the weather like in San Francisco?",
+                "input": "",
+                "response": "I'll check the current weather for you.\n\n<tool>get_weather</tool>\n{\"location\": \"San Francisco, CA\"}\n\nBased on the weather data, San Francisco is currently 68°F with partly cloudy skies and light winds from the west at 8 mph."
+            },
+            {
+                "instruction": "Search for recent papers about transformer architectures",
+                "input": "",
+                "response": "I'll search for recent research papers on transformer architectures.\n\n<tool>search_papers</tool>\n{\"query\": \"transformer architecture\", \"date_range\": \"2024\", \"limit\": 10}\n\nI found several recent papers on transformer architectures:\n1. \"Efficient Attention Mechanisms in Large Language Models\" (2024)\n2. \"Scaling Laws for Neural Language Models\" (2024)\n3. \"RoPE: Rotary Position Embedding\" (2024)"
+            },
+            {
+                "instruction": "Calculate the compound interest for $10,000 at 5% annual rate for 10 years",
+                "input": "",
+                "response": "I'll calculate the compound interest for you.\n\n<tool>calculate</tool>\n{\"expression\": \"10000 * (1 + 0.05)^10\"}\n\nUsing the compound interest formula A = P(1 + r)^t:\n- Principal (P): $10,000\n- Annual rate (r): 5% = 0.05\n- Time (t): 10 years\n\nResult: $16,288.95\nTotal interest earned: $6,288.95"
+            }
+        ]
 
-# Now tokenize the dataset with our trained tokenizer
-def tokenize_function(examples):
-    max_length = 256  # Increased sequence length for better context
-    results = {"input_ids": [], "labels": [], "attention_mask": []}
+    @staticmethod
+    def create_tokenizer(dataset: Dataset, vocab_size: int = 32000) -> Tokenizer:
+        """Create and train a conversation-aware tokenizer."""
+        print("🔤 Creating and training tokenizer...")
 
-    for text in examples["text"]:
-        # Skip empty texts
-        if not text.strip():
-            continue
+        # Initialize BPE tokenizer
+        tokenizer = Tokenizer(models.BPE())
 
-        # Tokenize the text
-        encoded = tokenizer.encode(text)
-        tokens = encoded.ids
+        # Set up pre-tokenization for better handling of code and JSON
+        tokenizer.pre_tokenizer = pre_tokenizers.Sequence([
+            pre_tokenizers.ByteLevel(add_prefix_space=False),
+            pre_tokenizers.Punctuation(),
+            pre_tokenizers.WhitespaceSplit()
+        ])
 
-        # Create attention mask (1 for real tokens)
-        attention_mask = [1] * len(tokens)
+        # Configure trainer
+        trainer = trainers.BpeTrainer(
+            vocab_size=vocab_size,
+            special_tokens=ConversationalDataProcessor.SPECIAL_TOKENS,
+            min_frequency=2,
+            continuing_subword_prefix="##",
+            end_of_word_suffix="</w>"
+        )
 
-        # Truncate if too long
-        if len(tokens) > max_length:
-            tokens = tokens[:max_length]
-            attention_mask = attention_mask[:max_length]
+        # Prepare training data
+        training_file = "tokenizer_training_data.txt"
+        with open(training_file, "w", encoding="utf-8") as f:
+            for item in dataset:
+                if "instruction" in item and "response" in item:
+                    # Format as conversation
+                    f.write(f"<user>{item['instruction']}</user>\n")
+                    if item.get("input"):
+                        f.write(f"<system>{item['input']}</system>\n")
+                    f.write(f"<assistant>{item['response']}</assistant>\n\n")
+                elif "text" in item:
+                    f.write(f"{item['text']}\n")
 
-        # Pad if too short
-        if len(tokens) < max_length:
-            padding_length = max_length - len(tokens)
-            tokens = tokens + [0] * padding_length
-            attention_mask = attention_mask + [0] * padding_length
+            # Add tool calling examples
+            f.write("<tool>search</tool>\n{\"query\": \"example\"}\n")
+            f.write("<tool>calculate</tool>\n{\"expression\": \"2+2\"}\n")
 
-        # Make sure all sequences are exactly max_length
-        assert len(tokens) == max_length, f"Token length {len(tokens)} != {max_length}"
-        assert len(attention_mask) == max_length, f"Mask length {len(attention_mask)} != {max_length}"
+        # Train tokenizer
+        tokenizer.train([training_file], trainer)
 
-        # Store the tokenized text
+        # Set up post-processing
+        tokenizer.post_processor = processors.TemplateProcessing(
+            single="<s> $A </s>",
+            pair="<s> $A </s> $B </s>",
+            special_tokens=[("<s>", 1), ("</s>", 2)],
+        )
+
+        # Cleanup
+        os.remove(training_file)
+
+        print(f"✅ Tokenizer trained with {tokenizer.get_vocab_size():,} tokens")
+        return tokenizer
+
+
+class ConversationalDataCollator:
+    """Efficient data collator for conversational training."""
+
+    def __init__(self, tokenizer: Tokenizer, max_length: int = 512):
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+
+    def __call__(self, features: List[Dict]) -> Dict[str, torch.Tensor]:
+        batch_size = len(features)
+
+        # Initialize batch tensors
+        input_ids = torch.zeros((batch_size, self.max_length), dtype=torch.long)
+        attention_mask = torch.zeros((batch_size, self.max_length), dtype=torch.long)
+        labels = torch.full((batch_size, self.max_length), -100, dtype=torch.long)
+
+        for i, feature in enumerate(features):
+            ids = feature["input_ids"]
+            seq_len = min(len(ids), self.max_length)
+
+            input_ids[i, :seq_len] = torch.tensor(ids[:seq_len])
+            attention_mask[i, :seq_len] = 1
+            labels[i, :seq_len] = torch.tensor(ids[:seq_len])
+
+        return {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "labels": labels,
+        }
+
+
+def tokenize_conversations(examples: Dict, tokenizer: Tokenizer, max_length: int = 512) -> Dict:
+    """Tokenize conversational data with proper formatting."""
+    results = {"input_ids": []}
+
+    for i in range(len(examples["instruction"])):
+        # Format conversation
+        conversation = f"<user>{examples['instruction'][i]}</user>"
+        if examples.get("input") and examples["input"][i]:
+            conversation += f"<system>{examples['input'][i]}</system>"
+        conversation += f"<assistant>{examples['response'][i]}</assistant>"
+
+        # Tokenize
+        encoded = tokenizer.encode(conversation)
+        tokens = encoded.ids[:max_length]  # Truncate if needed
+
         results["input_ids"].append(tokens)
-        results["labels"].append(tokens.copy())
-        results["attention_mask"].append(attention_mask)
 
     return results
 
-print("Tokenizing dataset...")
-ds = ds.map(
-    tokenize_function,
-    batched=True,
-    remove_columns=ds.column_names,
-    desc="Tokenizing dataset"
-)
 
-# Define a custom data collator to handle padding
-from dataclasses import dataclass
-from typing import Dict, List, Optional, Union
+# =============================================================================
+# Training Setup
+# =============================================================================
 
-@dataclass
-class CustomDataCollator:
-    def __call__(self, features: List[Dict[str, Union[List[int], torch.Tensor]]]) -> Dict[str, torch.Tensor]:
-        # First, pad all sequences to the same length
-        max_length = 128
+class TrainingProgressCallback(TrainerCallback):
+    """Enhanced training progress callback with metrics tracking."""
 
-        # Initialize batch tensors
-        batch = {}
-        batch["input_ids"] = torch.zeros((len(features), max_length), dtype=torch.long)
-        batch["labels"] = torch.zeros((len(features), max_length), dtype=torch.long)
-        batch["attention_mask"] = torch.zeros((len(features), max_length), dtype=torch.long)
-
-        # Fill batch tensors
-        for i, feature in enumerate(features):
-            input_ids = feature["input_ids"]
-            labels = feature["labels"]
-            attention_mask = feature.get("attention_mask", [1] * len(input_ids))
-
-            # Ensure all are the same length by padding
-            seq_length = min(len(input_ids), max_length)
-
-            # Copy data to batch tensors
-            batch["input_ids"][i, :seq_length] = torch.tensor(input_ids[:seq_length])
-            batch["labels"][i, :seq_length] = torch.tensor(labels[:seq_length])
-            batch["attention_mask"][i, :seq_length] = torch.tensor(attention_mask[:seq_length])
-
-        return batch
-
-args = TrainingArguments(
-    "deepzig-medium-demo",  # Output directly to the current directory
-    num_train_epochs          = 3,  # Fewer epochs for faster training
-    per_device_train_batch_size= 8,  # Smaller batch size to avoid memory issues
-    learning_rate             = 5e-5,  # Slightly higher learning rate for faster convergence
-    logging_steps             = 1,  # Log every step for better feedback
-    save_steps                = 50,  # Save more frequently
-    save_total_limit          = 2,  # Keep the last 2 checkpoints
-    gradient_accumulation_steps= 2,  # Smaller accumulation for faster updates
-    fp16                      = False,  # Disable mixed precision to avoid potential issues
-    report_to                 = "none",  # Don't report to wandb etc.
-    warmup_steps              = 10,  # Fewer warmup steps
-    weight_decay              = 0.01,  # Add weight decay for regularization
-    disable_tqdm              = False,  # Ensure progress bars are shown
-    logging_first_step        = True,  # Log the first step for immediate feedback
-    save_safetensors          = False  # Disable safetensors to allow weight sharing
-)
-# Create trainer with custom data collator
-trainer = Trainer(
-    model=model,
-    args=args,
-    train_dataset=ds,
-    data_collator=CustomDataCollator()
-)
-
-# 5. Train the model
-print("\nTraining the model...")
-from transformers.trainer_callback import TrainerCallback
-
-# Add progress callback for better visibility during training
-class ProgressCallback(TrainerCallback):
     def on_log(self, args, state, control, logs=None, **kwargs):
         if state.is_world_process_zero and logs:
-            print(f"Progress: {100 * state.global_step / state.max_steps:.1f}% complete")
+            epoch = state.epoch
+            step = state.global_step
+            total_steps = state.max_steps
+            progress = 100 * step / total_steps if total_steps > 0 else 0
 
-# Fix for weight sharing error by disabling safe serialization
-trainer = Trainer(
-    model=model,
-    args=args,
-    train_dataset=ds,
-    data_collator=CustomDataCollator(),
-    # Use existing optimizers if defined, otherwise let Trainer create them
-    optimizers=(optimizer, lr_scheduler) if 'optimizer' in locals() else (None, None),
-    callbacks=[ProgressCallback()]
-)
-trainer.train()
+            loss = logs.get("train_loss", 0)
+            learning_rate = logs.get("learning_rate", 0)
 
-# Save the model
-trainer.save_model(output_dir="deepzig-medium-demo")
-print("✅ Model training complete")
+            print(f"📈 Epoch {epoch:.2f} | Step {step}/{total_steps} ({progress:.1f}%) | Loss: {loss:.4f} | LR: {learning_rate:.2e}")
 
-# 6. Save model weights in Zig-compatible safetensors format
-print("\nSaving model weights in Zig-compatible format...")
 
-# Create output directory if it doesn't exist
-os.makedirs("deepzig-medium-demo", exist_ok=True)
+def setup_lora_training(model: DeepZigConversationalModel, rank: int = 16) -> DeepZigConversationalModel:
+    """Set up LoRA (Low-Rank Adaptation) for parameter-efficient fine-tuning."""
+    if not PEFT_AVAILABLE:
+        raise ImportError("PEFT not available. Install with: pip install peft")
 
-# Create a state dict with the model weights mapped to Zig-compatible names
-state_dict = {}
+    print(f"🔧 Setting up LoRA training with rank {rank}")
 
-# Add model weights to state dict with proper naming for Zig compatibility
-for name, param in model.named_parameters():
-    # Map Python model parameter names to Zig-compatible names
-    if name == "embed.weight":
-        state_dict["model.embed_tokens.weight"] = param.detach().cpu().numpy()
-    elif name == "lm_head.weight":
-        state_dict["lm_head.weight"] = param.detach().cpu().numpy()
-    elif name == "norm.weight":
-        state_dict["model.norm.weight"] = param.detach().cpu().numpy()
-    elif name.startswith("layers."):
-        # Handle transformer layers
-        parts = name.split(".")
-        layer_num = parts[1]
+    lora_config = LoraConfig(
+        task_type=TaskType.CAUSAL_LM,
+        r=rank,
+        lora_alpha=32,
+        lora_dropout=0.1,
+        target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+        bias="none",
+    )
 
-        if "attention" in name:
-            # Handle attention components
-            if "q_proj" in name:
-                state_dict[f"model.layers.{layer_num}.self_attn.q_proj.weight"] = param.detach().cpu().numpy()
-            elif "k_proj" in name:
-                state_dict[f"model.layers.{layer_num}.self_attn.k_proj.weight"] = param.detach().cpu().numpy()
-            elif "v_proj" in name:
-                state_dict[f"model.layers.{layer_num}.self_attn.v_proj.weight"] = param.detach().cpu().numpy()
-            elif "o_proj" in name:
-                state_dict[f"model.layers.{layer_num}.self_attn.o_proj.weight"] = param.detach().cpu().numpy()
-            elif "norm" in name:
-                state_dict[f"model.layers.{layer_num}.input_layernorm.weight"] = param.detach().cpu().numpy()
-        elif "mlp" in name:
-            # Handle MLP components
-            if "gate_proj" in name:
-                state_dict[f"model.layers.{layer_num}.mlp.gate_proj.weight"] = param.detach().cpu().numpy()
-            elif "down_proj" in name:
-                state_dict[f"model.layers.{layer_num}.mlp.down_proj.weight"] = param.detach().cpu().numpy()
-            elif "norm" in name:
-                state_dict[f"model.layers.{layer_num}.post_attention_layernorm.weight"] = param.detach().cpu().numpy()
-        else:
-            # Use a generic mapping for other parameters
-            state_dict[f"model.{name}"] = param.detach().cpu().numpy()
+    model = get_peft_model(model, lora_config)
+    print(f"✅ LoRA enabled. Trainable parameters: {model.num_parameters():,}")
+    return model
+
+
+def create_training_args(output_dir: str, num_epochs: int = 3, batch_size: int = 4, has_eval: bool = True) -> TrainingArguments:
+    """Create optimized training arguments following best practices."""
+
+    # Base arguments
+    args = {
+        "output_dir": output_dir,
+
+        # Training schedule
+        "num_train_epochs": num_epochs,
+        "per_device_train_batch_size": batch_size,
+        "per_device_eval_batch_size": batch_size,
+        "gradient_accumulation_steps": 4,
+
+        # Optimization
+        "learning_rate": 2e-4,
+        "weight_decay": 0.01,
+        "warmup_ratio": 0.03,
+        "lr_scheduler_type": "cosine",
+        "max_grad_norm": 1.0,
+
+        # Mixed precision and memory optimization
+        "fp16": True,
+        "gradient_checkpointing": True,   # Now properly implemented
+        "dataloader_pin_memory": True,
+
+        # Logging
+        "logging_steps": 25,
+        "save_steps": 500,
+        "save_total_limit": 3,
+
+        # Misc
+        "remove_unused_columns": False,
+        "report_to": "none",
+        "disable_tqdm": False,
+        "logging_first_step": True,
+    }
+
+    # Add evaluation-specific arguments only if we have an eval dataset
+    if has_eval:
+        args.update({
+            "eval_steps": 500,
+            "eval_strategy": "steps",
+            "load_best_model_at_end": True,
+            "metric_for_best_model": "eval_loss",
+            "greater_is_better": False,
+        })
     else:
-        # Use a generic mapping for other parameters
-        state_dict[f"model.{name}"] = param.detach().cpu().numpy()
+        args.update({
+            "eval_strategy": "no",
+        })
 
-# Save to safetensors format
-from safetensors.numpy import save_file
-save_file(state_dict, "deepzig-medium-demo/model.safetensors")
+    return TrainingArguments(**args)
 
-# Save config
-with open("deepzig-medium-demo/config.json", "w") as f:
-    json.dump(cfg_dict, f, indent=2)
 
-print("✅ Saved model, config, and tokenizer to deepzig-medium-demo")
+# =============================================================================
+# Model Export and Testing
+# =============================================================================
 
-# 7. Test the model with the tokenizer to ensure it generates text
-print("\nTesting text generation with the trained model:")
+def export_to_zig_format(model: DeepZigConversationalModel, tokenizer: Tokenizer, output_dir: str):
+    """Export model in Zig-compatible format with proper naming conventions."""
+    print("💾 Exporting model in Zig-compatible format...")
 
-# Move model to CPU for inference to avoid MPS device issues
-model.to("cpu")
-model.eval()
+    os.makedirs(output_dir, exist_ok=True)
 
-# Create an improved test function with enhanced sampling for better text generation
-def generate_text(prompt, max_length=100, temperature=0.8, top_k=40, top_p=0.9, repetition_penalty=1.2):
-    try:
-        # Tokenize the prompt with proper BOS token
-        if not prompt.startswith("<s>"):
-            prompt = "<s> " + prompt
+    # Prepare state dict with Zig-compatible naming
+    state_dict = {}
 
+    for name, param in model.named_parameters():
+        if "lora" in name.lower():
+            continue  # Skip LoRA weights for now
+
+        tensor = param.detach().cpu().numpy()
+
+        # Map to Zig-compatible names
+        if name == "embed_tokens.weight":
+            state_dict["model.embed_tokens.weight"] = tensor
+        elif name == "lm_head.weight":
+            state_dict["lm_head.weight"] = tensor
+        elif name == "norm.weight":
+            state_dict["model.norm.weight"] = tensor
+        elif name.startswith("layers."):
+            parts = name.split(".")
+            layer_idx = parts[1]
+
+            if "input_layernorm" in name:
+                state_dict[f"model.layers.{layer_idx}.input_layernorm.weight"] = tensor
+            elif "post_attention_layernorm" in name:
+                state_dict[f"model.layers.{layer_idx}.post_attention_layernorm.weight"] = tensor
+            elif "self_attn" in name:
+                component = ".".join(parts[3:])
+                state_dict[f"model.layers.{layer_idx}.self_attn.{component}"] = tensor
+            elif "mlp" in name:
+                component = ".".join(parts[3:])
+                state_dict[f"model.layers.{layer_idx}.mlp.{component}"] = tensor
+        else:
+            state_dict[f"model.{name}"] = tensor
+
+    # Save model weights
+    save_file(state_dict, os.path.join(output_dir, "model.safetensors"))
+
+    # Save configuration
+    config_dict = {
+        "model_type": "deepzig_conversational",
+        "architectures": ["DeepZigConversationalModel"],
+        "vocab_size": model.config.vocab_size,
+        "hidden_size": model.config.hidden_size,
+        "intermediate_size": model.config.intermediate_size,
+        "num_hidden_layers": model.config.num_hidden_layers,
+        "num_attention_heads": model.config.num_attention_heads,
+        "num_key_value_heads": model.config.num_key_value_heads,
+        "max_position_embeddings": model.config.max_position_embeddings,
+        "rope_base": model.config.rope_base,
+        "rms_norm_eps": model.config.rms_norm_eps,
+        "torch_dtype": "bfloat16",
+        "use_cache": True,
+        "pad_token_id": tokenizer.token_to_id("<pad>"),
+        "bos_token_id": tokenizer.token_to_id("<s>"),
+        "eos_token_id": tokenizer.token_to_id("</s>"),
+    }
+
+    with open(os.path.join(output_dir, "config.json"), "w") as f:
+        json.dump(config_dict, f, indent=2)
+
+    # Save tokenizer
+    tokenizer.save(os.path.join(output_dir, "tokenizer.json"))
+
+    # Save generation config
+    generation_config = GenerationConfig(
+        max_length=2048,
+        temperature=0.8,
+        top_p=0.9,
+        top_k=40,
+        repetition_penalty=1.1,
+        do_sample=True,
+        pad_token_id=tokenizer.token_to_id("<pad>"),
+        bos_token_id=tokenizer.token_to_id("<s>"),
+        eos_token_id=tokenizer.token_to_id("</s>"),
+    )
+    generation_config.save_pretrained(output_dir)
+
+    print(f"✅ Model exported to {output_dir}")
+
+
+def test_model_generation(model: DeepZigConversationalModel, tokenizer: Tokenizer):
+    """Test the trained model with conversation examples."""
+    print("\n🧪 Testing model generation...")
+
+    model.eval()
+    test_prompts = [
+        "<user>What is the weather like?</user><assistant>",
+        "<user>Explain quantum computing</user><assistant>",
+        "<user>Write a Python function to calculate fibonacci</user><assistant>",
+    ]
+
+    for prompt in test_prompts:
+        print(f"\n💬 Prompt: {prompt}")
+
+        # Tokenize
         encoded = tokenizer.encode(prompt)
-        input_ids = torch.tensor([encoded.ids], device="cpu")
-        prompt_length = len(encoded.ids)
+        input_ids = torch.tensor([encoded.ids])
 
-        # Track generated tokens for repetition penalty
-        generated_tokens = set(input_ids[0].tolist())
-
-        # Generate text
+        # Generate
         with torch.no_grad():
-            for _ in range(max_length):
-                # Get model output for current sequence
-                outputs = model(input_ids)
-                next_token_logits = outputs.logits[:, -1, :]
+            outputs = model.generate(
+                input_ids,
+                max_length=input_ids.shape[1] + 50,
+                temperature=0.8,
+                do_sample=True,
+                pad_token_id=tokenizer.token_to_id("<pad>"),
+                eos_token_id=tokenizer.token_to_id("</assistant>"),
+            )
 
-                # Apply repetition penalty to discourage repeating tokens
-                for token_id in generated_tokens:
-                    next_token_logits[0, token_id] /= repetition_penalty
+        # Decode
+        generated_text = tokenizer.decode(outputs[0].tolist())
+        print(f"🤖 Generated: {generated_text}")
 
-                # Apply temperature scaling
-                next_token_logits = next_token_logits / temperature
 
-                # Apply top-k filtering
-                if top_k > 0:
-                    top_k_logits, top_k_indices = torch.topk(next_token_logits, top_k)
-                    next_token_logits = torch.full_like(next_token_logits, float('-inf'))
-                    next_token_logits.scatter_(1, top_k_indices, top_k_logits)
+# =============================================================================
+# Main Training Function
+# =============================================================================
 
-                # Apply top-p (nucleus) filtering
-                if top_p < 1.0:
-                    sorted_logits, sorted_indices = torch.sort(next_token_logits, descending=True)
-                    cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+def main():
+    """Main training function with full pipeline."""
+    parser = argparse.ArgumentParser(description="Train DeepZig Conversational Model")
+    parser.add_argument("--use-lora", action="store_true", help="Use LoRA for parameter-efficient training")
+    parser.add_argument("--lora-rank", type=int, default=16, help="LoRA rank (default: 16)")
+    parser.add_argument("--max-samples", type=int, default=20000, help="Maximum training samples")
+    parser.add_argument("--eval-split", type=float, default=0.1, help="Evaluation split ratio")
+    parser.add_argument("--epochs", type=int, default=3, help="Number of training epochs")
+    parser.add_argument("--batch-size", type=int, default=4, help="Training batch size")
+    parser.add_argument("--output-dir", type=str, default="deepzig-conversational-model", help="Output directory")
 
-                    # Remove tokens with cumulative probability above the threshold
-                    sorted_indices_to_remove = cumulative_probs > top_p
-                    # Shift the indices to the right to keep also the first token above the threshold
-                    sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
-                    sorted_indices_to_remove[..., 0] = 0
+    args = parser.parse_args()
 
-                    indices_to_remove = sorted_indices[sorted_indices_to_remove]
-                    next_token_logits[0, indices_to_remove] = float('-inf')
+    print("🚀 Starting DeepZig Conversational Model Training")
+    print("=" * 60)
 
-                # Sample from the filtered distribution
-                probs = F.softmax(next_token_logits, dim=-1)
-                next_token = torch.multinomial(probs, num_samples=1).squeeze(1)
+    # 1. Load and process data
+    print("📚 Loading datasets...")
+    dataset = ConversationalDataProcessor.load_datasets(max_samples=args.max_samples)
 
-                # Add the new token to the sequence
-                input_ids = torch.cat([input_ids, next_token.unsqueeze(0)], dim=1)
-                generated_tokens.add(next_token.item())
+    # 2. Create tokenizer
+    tokenizer = ConversationalDataProcessor.create_tokenizer(dataset)
 
-                # Stop if we predict EOS, </s>, or after generating several newlines
-                if (next_token.item() == tokenizer.token_to_id("</s>") or
-                    next_token.item() == tokenizer.token_to_id("\n") or
-                    next_token.item() == tokenizer.token_to_id("<eos>") or
-                    (len(input_ids[0]) > prompt_length + 10 and
-                     input_ids[0][-3:].tolist().count(tokenizer.token_to_id("\n")) >= 2)):
-                    break
+    # 3. Tokenize dataset
+    print("🔤 Tokenizing dataset...")
+    tokenized_dataset = dataset.map(
+        lambda x: tokenize_conversations(x, tokenizer),
+        batched=True,
+        remove_columns=dataset.column_names,
+        desc="Tokenizing conversations"
+    )
 
-        # Decode the generated text
-        generated_ids = input_ids[0].tolist()
-
-        # Get just the generated part (not the prompt)
-        generated_part = generated_ids[prompt_length:]
-
-        # Clean up the text
-        full_text = tokenizer.decode(generated_ids)
-        generated_text = tokenizer.decode(generated_part)
-
-        # Clean up special tokens
-        generated_text = generated_text.replace("<s>", "").replace("</s>", "").replace("<pad>", "")
-
-        return f"{prompt.replace('<s> ', '')}{generated_text}"
-    except Exception as e:
-        print(f"Error during generation: {e}")
-        return f"Error: {str(e)}"
-
-# Test with a variety of prompts using different generation parameters
-test_prompts = [
-    "The quick brown fox jumps over",
-    "In the beginning there was",
-    "Once upon a time in a land far away",
-    "Zig is a programming language designed for",
-    "The history of artificial intelligence begins with",
-    "The most important feature of DeepZig is",
-    "To generate high-quality text, language models need"
-]
-
-print("\nGenerating with balanced parameters (temperature=0.7, top_k=50, top_p=0.92, repetition_penalty=1.2):")
-for prompt in test_prompts:
-    print(f"\nPrompt: {prompt}")
-    generated = generate_text(prompt, max_length=150, temperature=0.7, top_k=50, top_p=0.92, repetition_penalty=1.2)
-    print(f"Generated: {generated}")
-
-print("\nGenerating with creative parameters (temperature=1.0, top_k=100, top_p=0.95, repetition_penalty=1.3):")
-for prompt in test_prompts[:3]:  # Try a subset with different parameters
-    print(f"\nPrompt: {prompt}")
-    generated = generate_text(prompt, max_length=150, temperature=1.0, top_k=100, top_p=0.95, repetition_penalty=1.3)
-    print(f"Generated: {generated}")
-
-print("\nGenerating with focused parameters (temperature=0.5, top_k=20, top_p=0.85, repetition_penalty=1.5):")
-for prompt in test_prompts[3:5]:  # Try technical prompts with more focused parameters
-    print(f"\nPrompt: {prompt}")
-    generated = generate_text(prompt, max_length=200, temperature=0.5, top_k=20, top_p=0.85, repetition_penalty=1.5)
-    print(f"Generated: {generated}")
-
-# 7. Save model weights in Zig-compatible safetensors format
-print("\nSaving model weights in Zig-compatible format...")
-
-# Create output directory if it doesn't exist
-os.makedirs("deepzig-medium-demo", exist_ok=True)
-
-# Create a state dict with the model weights mapped to Zig-compatible names
-state_dict = {}
-
-# Add model weights to state dict with proper naming for Zig compatibility
-for name, param in model.named_parameters():
-    # Map Python model parameter names to Zig-compatible names
-    if name == "embed.weight":
-        state_dict["model.embed_tokens.weight"] = param.detach().cpu().numpy()
-    elif name == "lm_head.weight":
-        state_dict["lm_head.weight"] = param.detach().cpu().numpy()
-    elif name == "norm.weight":
-        state_dict["model.norm.weight"] = param.detach().cpu().numpy()
-    elif name.startswith("layers."):
-        # Handle transformer layers
-        layer_num = name.split(".")[1]
-        if name.endswith(".0.weight") or name.endswith(".0.bias"):
-            # First linear layer in MLP
-            suffix = name.split(".")[-1]
-            state_dict[f"model.layers.{layer_num}.mlp.gate_proj.{suffix}"] = param.detach().cpu().numpy()
-        elif name.endswith(".2.weight") or name.endswith(".2.bias"):
-            # Second linear layer in MLP
-            suffix = name.split(".")[-1]
-            state_dict[f"model.layers.{layer_num}.mlp.down_proj.{suffix}"] = param.detach().cpu().numpy()
-        else:
-            # Use a generic mapping for other parameters
-            state_dict[f"model.{name}"] = param.detach().cpu().numpy()
+    # 4. Train/eval split
+    if args.eval_split > 0:
+        split_dataset = tokenized_dataset.train_test_split(test_size=args.eval_split, seed=42)
+        train_dataset = split_dataset["train"]
+        eval_dataset = split_dataset["test"]
     else:
-        # Use a generic mapping for other parameters
-        state_dict[f"model.{name}"] = param.detach().cpu().numpy()
+        train_dataset = tokenized_dataset
+        eval_dataset = None
 
-# Save to safetensors format
-from safetensors.numpy import save_file
-save_file(state_dict, "deepzig-medium-demo/model.safetensors")
+    # 5. Create model
+    print("🏗️ Creating model...")
+    config = DeepZigConfig(vocab_size=tokenizer.get_vocab_size())
+    model = DeepZigConversationalModel(config)
 
-# Save config
-with open("deepzig-medium-demo/config.json", "w") as f:
-    json.dump(cfg_dict, f, indent=2)
+    print(f"📊 Model parameters: {model.num_parameters():,}")
 
-# Save tokenizer files
-tokenizer.save("deepzig-medium-demo/tokenizer.json")
+    # 6. Setup LoRA if requested
+    if args.use_lora:
+        model = setup_lora_training(model, rank=args.lora_rank)
 
-print("✅ Saved model, config, and tokenizer to deepzig-medium-demo")
+    # 7. Create data collator
+    data_collator = ConversationalDataCollator(tokenizer)
+
+    # 8. Setup training
+    training_args = create_training_args(args.output_dir, args.epochs, args.batch_size, has_eval=(eval_dataset is not None))
+
+    trainer = Trainer(
+        model=model,
+        args=training_args,
+        train_dataset=train_dataset,
+        eval_dataset=eval_dataset,
+        data_collator=data_collator,
+        callbacks=[TrainingProgressCallback()],
+    )
+
+    # 9. Train model
+    print("🏃 Starting training...")
+    trainer.train()
+
+    # 10. Save model
+    print("💾 Saving model...")
+    trainer.save_model()
+
+    # 11. Export to Zig format
+    export_to_zig_format(model, tokenizer, args.output_dir)
+
+    # 12. Test generation
+    test_model_generation(model, tokenizer)
+
+    print("\n🎉 Training completed successfully!")
+    print(f"📁 Model saved to: {args.output_dir}")
+    print("🔧 Ready for Zig integration!")
+
+
+if __name__ == "__main__":
+    main()
