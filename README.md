@@ -4,7 +4,7 @@
 <hr>
 <div align="center" style="line-height: 1.5;">
   <a href="https://ziglang.org/"><img src="https://img.shields.io/badge/Language-Zig-F7A41D?style=for-the-badge&logo=zig&logoColor=white" alt="Language: Zig"></a>
-  <a href="LICENSE-CODE"><img src="https://img.shields.io/badge/License-DSV3-blue.svg?style=for-the-badge" alt="License: DeepSeek"></a>
+  <a href="LICENSE-CODE"><img src="https://img.shields.io/badge/License-DZV3-blue.svg?style=for-the-badge" alt="License: DeepZig"></a>
   <a href="#status"><img src="https://img.shields.io/badge/Status-Draft-orange?style=for-the-badge" alt="Status: Draft"></a>
   <br>
   <a href="#why-propose-deepseek-v3-in-zig"><img src="https://img.shields.io/badge/Performance-High_Efficiency-44CC11?style=for-the-badge" alt="Performance: High Efficiency"></a>
@@ -20,31 +20,32 @@
 
 ## Overview
 
-A **DRAFT implementation** of DeepSeek V3 in Zig to create a high-performance, web-ready LLM inference engine. This leverages Zig's unique advantages for systems programming while targeting modern deployment scenarios.
+A **DRAFT implementation** of DeepZig V3 in Zig to create a high-performance, web-ready LLM inference engine. This leverages Zig's unique advantages for systems programming while targeting modern deployment scenarios.
 
 **✅ Status: DRAFT IMPLEMENTATION WITH FOUNDATION COMPONENTS** 
 
 ✅ **Core architecture with foundational features**, including:
-- ✅ **Multi-Head Latent Attention (MLA)** - Core DeepSeek V3 innovation architecturally implemented and tested
-- ✅ **Base Configuration System** - HuggingFace config.json loading with comprehensive validation  
-- ✅ **Drafted BPE Tokenizer** - Supports HuggingFace tokenizer.json format with encoding/decoding
+- ✅ **Multi-Head Latent Attention (MLA)** - Core DeepZig V3 innovation architecturally implemented
+- ✅ **Configuration System** - HuggingFace config.json loading with comprehensive validation  
+- ✅ **BPE Tokenizer** - Supports HuggingFace tokenizer.json format with encoding/decoding
 - ✅ **Generative Pipeline** - Draft inference framework with greedy/sampling support
 - ✅ **Model Validation Framework** - Real weight loading with safetensors format verification
-- ✅ **Base Transformer Architecture** with RMS normalization, SwiGLU, MoE integration
+- ✅ **Draft Transformer Architecture** with RMS normalization, SwiGLU, MoE integration
 - ✅ **Draft Validation Framework** - Multi-dimensional testing (7/8 tests passing, 84.4% confidence)
 - ✅ **RoPE (Rotary Position Encoding)** with pre-computed embeddings
 - ✅ **KV Cache** for efficient autoregressive inference  
-- ✅ HTTP server framework (basic structure)
-- ✅ SIMD-optimized tensor operations (draft implementation)
-- ✅ Cross-platform backend architecture
-- ✅ Initial memory management
+- ✅ **HTTP server** (draft) with OpenAI-compatible API 
+- ✅ **SIMD-optimized tensor operations**
+- ✅ **Cross-platform backend architecture**
+- ✅ **Initial Memory management** with cleanup
 - ✅ **Apple Silicon M-series detection** (hardware detection via sysctl)
-- ✅ Build system draft
-- ✅ **BLAS integration working** (Apple Accelerate backend functional)
-- ✅ **Improved matrix operations** (1000+ GFLOPS performance on an M1 Macbook)
+- ✅ **Build system** with Zig 0.15.0-dev support
+- ✅ **Initial BLAS integration** (Apple Accelerate backend functional)
+- ✅ **Drafted matrix operations** (1000+ GFLOPS performance on an M1 Macbook)
+- ✅ **Multiple model sizes** - Tiny, small, and medium configurations
 - ⚠️ **DRAFT IMPLEMENTATION** - Theoretically solid foundation ready for real model loading and production deployment testing
 
-**Performance Update**: ~~Current naive algorithms are ~1000x slower than optimized BLAS~~ **MLA attention architecture with BLAS integration now drafted.** Matrix multiplication: **2.1ms for 1024×1024** at **1143 GFLOPS**, with peak **1143 GFLOPS at 512×512** on an M1 MacBook Pro under heavy load. This represents a ~**3000x speedup** over our initial naive implementation. See [experimental benchmarks](experimental/README.md#performance-notes) for detailed performance data.
+**Performance Update**: ~~Current naive algorithms are 1000x slower than optimized BLAS~~ **MLA attention architecture with BLAS integration now drafted.** Matrix multiplication: **2.1ms for 1024×1024** at **1143 GFLOPS**, with peak **1143 GFLOPS at 512×512** on an M1 MacBook Pro under heavy load. This represents a ~**3000x speedup** over our initial naive implementation. See [experimental benchmarks](experimental/README.md#performance-notes) for detailed performance data.
 
 **⚠️ Important**: This is a **draft implementation** following DeepSeek V3 paper specifications with foundational components. Architecture is drafted with drafted HuggingFace compatibility, drafted theoretically solid tokenization, and drafted model validation framework. Draft validation shows strong foundation (7/8 tests passing, 84.4% confidence) with optimization opportunities identified.
 

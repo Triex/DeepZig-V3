@@ -39,6 +39,7 @@ This implementation leverages Zig's unique advantages for systems programming to
 - **🆕 HuggingFace Compatibility** - Load models directly from HuggingFace format
 - **🆕 Theoretically Solid Tokenization** - Full BPE implementation with special token support
 - **🆕 Base Configuration** - Comprehensive model configuration draft with validation
+- **🆕 Multiple Model Sizes** - Support for tiny, small, and medium model configurations (initial draft)
 
 **🚀 BLAS Acceleration Achieved!** We've successfully integrated Apple Accelerate backend delivering **1000+ GFLOPS** performance - a **3000x speedup** over the initial naive implementation. Measured on an M1 Macbook.
 
