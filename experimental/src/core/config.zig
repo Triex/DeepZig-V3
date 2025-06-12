@@ -82,7 +82,7 @@ pub const ModelConfig = struct {
 
         const file = std.fs.cwd().openFile(config_path, .{}) catch |err| switch (err) {
             error.FileNotFound => {
-                std.log.warn("⚠️ Config file not found, using default DeepSeek V3 config");
+                std.log.warn("⚠️ Config file not found, using default DeepSeek V3 config", .{});
                 return defaultDeepSeekV3();
             },
             else => return err,
@@ -99,7 +99,7 @@ pub const ModelConfig = struct {
     pub fn parseFromJson(allocator: Allocator, json_str: []const u8) !ModelConfig {
         var parsed = json.parseFromSlice(json.Value, allocator, json_str, .{}) catch |err| {
             std.log.err("❌ Failed to parse config JSON: {}", .{err});
-            std.log.info("📋 Using default DeepSeek V3 configuration");
+            std.log.info("📋 Using default DeepSeek V3 configuration", .{});
             return defaultDeepSeekV3();
         };
         defer parsed.deinit();

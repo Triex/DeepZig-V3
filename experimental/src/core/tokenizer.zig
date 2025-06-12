@@ -59,7 +59,7 @@ pub const Tokenizer = struct {
 
         const file = std.fs.cwd().openFile(tokenizer_path, .{}) catch |err| switch (err) {
             error.FileNotFound => {
-                std.log.warn("⚠️ Tokenizer file not found, using basic tokenizer");
+                std.log.warn("⚠️ Tokenizer file not found, using basic tokenizer", .{});
                 return try Self.init(allocator, 129280); // Default DeepSeek V3 vocab size
             },
             else => return err,

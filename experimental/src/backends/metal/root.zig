@@ -52,10 +52,10 @@ pub const MetalBackend = struct {
                     );
                 }
             } else {
-                std.log.warn("Metal is available but not running on Apple Silicon");
+                std.log.warn("Metal is available but not running on Apple Silicon", .{});
             }
         } else {
-            std.log.warn("Metal Backend not available on this platform");
+            std.log.warn("Metal Backend not available on this platform", .{});
         }
         
         return Self{
@@ -117,7 +117,7 @@ pub const MetalBackend = struct {
         // 4. Copy results back to tensor
         
         // For now, fallback to CPU implementation
-        std.log.warn("Falling back to CPU implementation, Metal not implemented");
+        std.log.warn("Falling back to CPU implementation, Metal not implemented", .{});
         return error.NotImplemented;
     }
     

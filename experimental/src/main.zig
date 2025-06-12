@@ -18,9 +18,28 @@ const Config = struct {
     max_concurrent_requests: u32 = 100,
     max_sequence_length: u32 = 32768,
     model_size: ModelSize = .tiny, // default to tiny for fast startup
+    allocator: ?Allocator = null, // Store allocator for cleanup
 
     const Backend = enum { cpu, metal, cuda, webgpu };
     const ModelSize = enum { tiny, small, full };
+    
+    /// Free any memory allocated for this config
+    pub fn deinit(self: *Config) void {
+        if (self.allocator) |alloc| {
+            // Free host if it's not the default value
+            if (!std.mem.eql(u8, self.host, "127.0.0.1")) {
+                alloc.free(self.host);
+            }
+            
+            // Free model path if it exists
+            if (self.model_path) |path| {
+                alloc.free(path);
+                self.model_path = null;
+            }
+            
+            self.allocator = null;
+        }
+    }
 };
 
 pub fn main() !void {
@@ -29,7 +48,8 @@ pub fn main() !void {
     const allocator = gpa.allocator();
 
     // Parse command line arguments
-    const config = try parseArgs(allocator);
+    var config = try parseArgs(allocator);
+    defer config.deinit();
 
     // Initialize the selected backend
     var backend = try initBackend(allocator, config.backend);
@@ -39,10 +59,18 @@ pub fn main() !void {
     var model: deepseek_core.Model = switch (config.model_size) {
         .tiny => try deepseek_core.Model.loadTiny(allocator, backend),
         .small => try deepseek_core.Model.loadSmall(allocator, backend),
-        .full => if (config.model_path) |path|
-                    try deepseek_core.Model.loadFromPath(allocator, path, backend)
-                 else
-                    try deepseek_core.Model.loadDefault(allocator, backend),
+        .full => if (config.model_path) |path| blk: {
+            const stat = std.fs.cwd().statFile(path) catch |err| {
+                std.log.err("❌ Unable to stat model path {s}: {}", .{path, err});
+                return err;
+            };
+            if (stat.kind == .directory) {
+                break :blk try deepseek_core.Model.loadFromDirectory(allocator, path, backend);
+            } else {
+                break :blk try deepseek_core.Model.loadFromPath(allocator, path, backend);
+            }
+        } else
+            try deepseek_core.Model.loadDefault(allocator, backend),
     };
     defer model.deinit();
 
@@ -88,7 +116,7 @@ fn parseArgs(allocator: Allocator) !Config {
     const args = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, args);
 
-    var config = Config{};
+    var config = Config{ .allocator = allocator };
 
     // Environment variable overrides
     if ((std.process.hasEnvVar(allocator, "DZ_TINY") catch false))
@@ -104,10 +132,12 @@ fn parseArgs(allocator: Allocator) !Config {
             config.port = try std.fmt.parseInt(u16, args[i + 1], 10);
             i += 1;
         } else if (std.mem.eql(u8, arg, "--host") and i + 1 < args.len) {
-            config.host = args[i + 1];
+            // Duplicate the host string so it remains valid after args are freed
+            config.host = try allocator.dupe(u8, args[i + 1]);
             i += 1;
         } else if (std.mem.eql(u8, arg, "--model") and i + 1 < args.len) {
-            config.model_path = args[i + 1];
+            // Duplicate the model path slice because args will be freed before use
+            config.model_path = try allocator.dupe(u8, args[i + 1]);
             config.model_size = .full;
             i += 1;
         } else if (std.mem.eql(u8, arg, "--backend") and i + 1 < args.len) {

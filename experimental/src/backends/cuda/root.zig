@@ -24,7 +24,7 @@ pub const CudaBackend = struct {
             // TODO: Initialize CUDA context and device
             // TODO: Query device properties
         } else {
-            std.log.warn("CUDA Backend not available - no CUDA runtime detected");
+            std.log.warn("CUDA Backend not available - no CUDA runtime detected", .{});
         }
         
         return Self{
