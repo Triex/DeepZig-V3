@@ -209,7 +209,7 @@ Current LLM inference is dominated by Python/PyTorch, which introduces:
 
 ## Getting Started
 
-**Current Status**: This repository contains a **FUNCTIONAL IMPLEMENTATION** of DeepSeek V3's core architecture. 
+**Current Status**: This repository contains a **THEORETICALLY SOLID IMPLEMENTATION** of DeepSeek V3's core architecture. 
 
 ### For the Current Zig Implementation:
 ```bash
