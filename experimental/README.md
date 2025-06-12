@@ -309,9 +309,9 @@ Draft BPE tokenization provides (theoretical foundation):
 
 ### Implementation Approach
 
-**Theoretically Solid**: Enhanced implementation ready for real model deployment testing
-**HuggingFace Compatible**: Direct integration with popular model format
-**Memory Efficient**: Proper tensor memory management and reuse
+**Theoretically Solid**: Enhanced implementation ready for real model deployment testing<br />
+**HuggingFace Compatible**: Direct integration with popular model format<br />
+**Memory Efficient**: Proper tensor memory management and reuse<br />
 **Extensible**: Clean interfaces for adding advanced features
 
 ## Contributing
