@@ -140,37 +140,37 @@ pub const Model = struct {
         const tokenizer = try Tokenizer.init(allocator, default_config.vocab_size);
         return try Self.loadFromSafetensorsWithConfig(allocator, path, default_config, tokenizer, backend);
     }
-    
+
     /// Initialize model from provided configuration
     /// Creates a model with random weights based on the configuration
     pub fn initFromConfig(allocator: Allocator, config: *ModelConfig) !Self {
         std.log.info("🔧 Initializing model from config: {}", .{config});
-        
+
         // Create backend with CPU for training
         const backend = Backend.init(allocator, .cpu, 0);
-        
+
         // Create tokenizer
         const tokenizer = try Tokenizer.init(allocator, config.vocab_size);
-        
+
         // Initialize transformer with the config
         const transformer = try Transformer.init(allocator, config.*, backend);
-        
+
         // Create embedding layer
         const embed_dims = [_]usize{ config.vocab_size, config.hidden_size };
         var embed_tokens = try FloatTensor.init(allocator, &embed_dims);
         try initializeEmbedding(&embed_tokens);
-        
+
         // Create embedding positions (optional)
         const embed_positions: ?FloatTensor = null;
-        
+
         // Create output layers
         const norm_dims = [_]usize{ config.hidden_size };
         const norm = try FloatTensor.init(allocator, &norm_dims);
-        
+
         const lm_head_dims = [_]usize{ config.hidden_size, config.vocab_size };
         var lm_head = try FloatTensor.init(allocator, &lm_head_dims);
         try initializeLinear(&lm_head);
-        
+
         return Self{
             .config = config.*,
             .transformer = transformer,
@@ -395,9 +395,9 @@ pub const Model = struct {
             tensor_data,
         ) orelse blk: {
             std.log.warn("⚠️ Final norm weights not found, using ones initialization", .{});
-            var tensor = try FloatTensor.init(allocator, &[_]usize{config.hidden_size});
-            tensor.fill(1.0);
-            break :blk tensor;
+            var norm_tensor = try FloatTensor.init(allocator, &[_]usize{config.hidden_size});
+            norm_tensor.fill(1.0);
+            break :blk norm_tensor;
         };
 
         std.log.info("✅ Model created successfully with real weights!", .{});
@@ -437,27 +437,49 @@ pub const Model = struct {
         const end_offset = tensor_info.data_offsets[1];
         const data_slice = tensor_data[start_offset..end_offset];
 
-        // Convert data based on dtype
-        if (std.mem.eql(u8, tensor_info.dtype, "F32") or
-            std.mem.eql(u8, tensor_info.dtype, "F16") or
-            std.mem.eql(u8, tensor_info.dtype, "BF16")) {
-            // Copy the data directly into the tensor
-            // TODO: Handle type conversion if needed
-            try t_tensor.copyFromBytes(data_slice);
+                // Convert data based on dtype
+        if (std.mem.eql(u8, tensor_info.dtype, "F32")) {
+            // Direct copy for F32 data
+            if (data_slice.len != t_tensor.data.len * @sizeOf(f32)) {
+                std.log.err("❌ Data size mismatch: expected {}, got {}", .{ t_tensor.data.len * @sizeOf(f32), data_slice.len });
+                t_tensor.deinit();
+                return ModelError.SafetensorsError;
+            }
+            const f32_data = std.mem.bytesAsSlice(f32, data_slice);
+            @memcpy(t_tensor.data, f32_data);
+        } else if (std.mem.eql(u8, tensor_info.dtype, "BF16")) {
+            // Convert BF16 to F32
+            if (data_slice.len != t_tensor.data.len * @sizeOf(u16)) {
+                std.log.err("❌ Data size mismatch for BF16: expected {}, got {}", .{ t_tensor.data.len * @sizeOf(u16), data_slice.len });
+                t_tensor.deinit();
+                return ModelError.SafetensorsError;
+            }
             const u16_data = std.mem.bytesAsSlice(u16, data_slice);
             for (u16_data, 0..) |val, i| {
                 // BF16 to F32: shift left by 16 bits
                 const f32_bits = @as(u32, val) << 16;
-                tensor.data[i] = @bitCast(f32_bits);
+                t_tensor.data[i] = @bitCast(f32_bits);
+            }
+        } else if (std.mem.eql(u8, tensor_info.dtype, "F16")) {
+            // Convert F16 to F32 (simplified - assumes little endian)
+            if (data_slice.len != t_tensor.data.len * @sizeOf(u16)) {
+                std.log.err("❌ Data size mismatch for F16: expected {}, got {}", .{ t_tensor.data.len * @sizeOf(u16), data_slice.len });
+                t_tensor.deinit();
+                return ModelError.SafetensorsError;
+            }
+            const u16_data = std.mem.bytesAsSlice(u16, data_slice);
+            for (u16_data, 0..) |val, i| {
+                // F16 to F32 conversion (simplified)
+                t_tensor.data[i] = @floatCast(@as(f16, @bitCast(val)));
             }
         } else {
             std.log.err("❌ Unsupported dtype: {s}", .{tensor_info.dtype});
-            tensor.deinit();
+            t_tensor.deinit();
             return ModelError.UnsupportedFormat;
         }
 
         std.log.debug("✅ Loaded tensor {s} successfully", .{tensor_name});
-        return tensor;
+        return t_tensor;
     }
 
     /// Load default/demo model with custom config
@@ -522,120 +544,110 @@ pub const Model = struct {
         self.transformer.deinit();
         self.backend.deinit();
         self.embed_tokens.deinit();
-        
-        if (self.embed_positions) |positions| {
+
+        if (self.embed_positions) |*positions| {
             positions.deinit();
         }
-        
+
         self.norm.deinit();
         self.lm_head.deinit();
     }
-    
+
     /// Returns an ArrayList containing all trainable parameters of the model
     /// The caller owns the ArrayList but not the tensors within
     pub fn parameters(self: *Self) !ArrayList(*tensor.Tensor(.f32)) {
         var params = ArrayList(*tensor.Tensor(.f32)).init(self.allocator);
         errdefer params.deinit();
-        
+
         // Add embedding parameters
         try params.append(&self.embed_tokens);
-        
+
         // Add transformer parameters
         var transformer_params = try self.transformer.parameters();
         defer transformer_params.deinit();
-        
+
         for (transformer_params.items) |param| {
             try params.append(param);
         }
-        
+
         // Add output layer parameters
         try params.append(&self.norm);
         try params.append(&self.lm_head);
-        
+
         return params;
     }
 
     /// Simple text generation function for testing
     pub fn generateText(self: *Self, prompt: []const u8, max_tokens: u32) ![]const u8 {
-        _ = max_tokens; // TODO: Use for generation loop
         std.log.info("🤖 Generating response for: '{s}'", .{prompt});
-        
-        // Tokenize input
-        const input_tokens = try self.tokenizer.encode(prompt);
-        defer self.allocator.free(input_tokens);
-        
-        std.log.info("📝 Input tokens: {} -> {any}", .{ input_tokens.len, input_tokens[0..@min(10, input_tokens.len)] });
-        
-        // Determine sequence length
-        const seq_len = input_tokens.len;
-        
-        // Embedding lookup: input_ids -> hidden_states
-        var hidden_states = try FloatTensor.init(self.allocator, &[_]usize{ 1, seq_len, self.config.hidden_size });
-        defer hidden_states.deinit();
-        
-        // Simple embedding lookup (normally this would be proper embedding layer)
-        for (0..seq_len) |s| {
-            const token_id = input_tokens[s];
-            const embed_idx = @min(token_id, self.config.vocab_size - 1);
-            
-            for (0..self.config.hidden_size) |h| {
-                const embed_offset = embed_idx * self.config.hidden_size + h;
-                const hidden_offset = s * self.config.hidden_size + h;
-                hidden_states.data[hidden_offset] = self.embed_tokens.data[embed_offset];
+
+        // Tokenize prompt and copy into dynamic list we can keep appending to
+        const prompt_tokens = try self.tokenizer.encode(prompt);
+        defer self.allocator.free(prompt_tokens);
+
+        var all_tokens = std.ArrayList(u32).init(self.allocator);
+        defer all_tokens.deinit();
+        try all_tokens.appendSlice(prompt_tokens);
+
+        // Greedy sampling loop
+        var step: u32 = 0;
+        while (step < max_tokens) : (step += 1) {
+            const seq_len = all_tokens.items.len;
+
+            // 1. Embedding lookup -> hidden_states tensor [1, seq_len, hidden]
+            var hidden_states = try FloatTensor.init(self.allocator, &[_]usize{ 1, seq_len, self.config.hidden_size });
+            defer hidden_states.deinit();
+
+            for (0..seq_len) |s| {
+                const token_id = all_tokens.items[s];
+                const embed_idx = @min(token_id, self.config.vocab_size - 1);
+                for (0..self.config.hidden_size) |h| {
+                    const embed_offset = embed_idx * self.config.hidden_size + h;
+                    const hidden_offset = s * self.config.hidden_size + h;
+                    hidden_states.data[hidden_offset] = self.embed_tokens.data[embed_offset];
+                }
             }
-        }
-        
-        std.log.info("📊 Hidden states shape: {}x{}x{}", .{ 1, seq_len, self.config.hidden_size });
-        
-        // Forward pass through transformer
-        var output_hidden = try FloatTensor.init(self.allocator, &[_]usize{ 1, seq_len, self.config.hidden_size });
-        defer output_hidden.deinit();
-        
-        try self.transformer.forward(&hidden_states, null, null, null, false, &output_hidden);
-        
-        // Skip final norm for now (placeholder)
-        const normed_output_ptr = &output_hidden;
-        
-        // Project to vocabulary: [batch, seq_len, hidden] -> [seq_len, vocab]
-        var logits = try FloatTensor.init(self.allocator, &[_]usize{ seq_len, self.config.vocab_size });
-        defer logits.deinit();
-        
-        // Simple matrix multiplication: normed_output @ lm_head -> logits
-        // This is a simplified version - in practice you'd use BLAS
-        for (0..seq_len) |s| {
+
+            // 2. Transformer forward
+            var output_hidden = try FloatTensor.init(self.allocator, &[_]usize{ 1, seq_len, self.config.hidden_size });
+            defer output_hidden.deinit();
+            try self.transformer.forward(&hidden_states, null, null, null, false, &output_hidden);
+
+            // 3. Compute logits for last position only
+            const last_offset = (seq_len - 1) * self.config.hidden_size;
+            var next_logits = try FloatTensor.init(self.allocator, &[_]usize{ self.config.vocab_size });
+            defer next_logits.deinit();
+
             for (0..self.config.vocab_size) |v| {
                 var sum: f32 = 0.0;
                 for (0..self.config.hidden_size) |h| {
-                    const hidden_val = normed_output_ptr.data[s * self.config.hidden_size + h];
+                    const hidden_val = output_hidden.data[last_offset + h];
                     const weight_val = self.lm_head.data[h * self.config.vocab_size + v];
                     sum += hidden_val * weight_val;
                 }
-                logits.data[s * self.config.vocab_size + v] = sum;
+                next_logits.data[v] = sum;
             }
-        }
-        
-        // Get next token (greedy sampling from last position)
-        const last_pos_offset = (seq_len - 1) * self.config.vocab_size;
-        var max_logit: f32 = logits.data[last_pos_offset];
-        var next_token: u32 = 0;
-        
-        for (1..self.config.vocab_size) |v| {
-            const logit = logits.data[last_pos_offset + v];
-            if (logit > max_logit) {
-                max_logit = logit;
-                next_token = @intCast(v);
+
+            // 4. Greedy pick highest logit
+            var best_idx: u32 = 0;
+            var best_logit: f32 = next_logits.data[0];
+            for (1..self.config.vocab_size) |i| {
+                const lg = next_logits.data[i];
+                if (lg > best_logit) {
+                    best_logit = lg;
+                    best_idx = @intCast(i);
+                }
             }
+
+            std.log.info("🎯 Step {} -> token {} (logit: {d:.3})", .{step, best_idx, best_logit});
+
+            // 5. Append token and check EOS
+            try all_tokens.append(best_idx);
+            if (best_idx == self.config.eos_token_id) break; // stop if EOS
         }
-        
-        std.log.info("🎯 Next token: {} (logit: {d:.3})", .{ next_token, max_logit });
-        
-        // Decode next token
-        const output_tokens = try self.allocator.alloc(u32, 1);
-        defer self.allocator.free(output_tokens);
-        output_tokens[0] = next_token;
-        
-        const generated_text = try self.tokenizer.decode(output_tokens);
-        
+
+        const generated_slice = all_tokens.items[prompt_tokens.len..];
+        const generated_text = try self.tokenizer.decode(generated_slice);
         std.log.info("✅ Generated: '{s}'", .{generated_text});
         return generated_text;
     }
@@ -727,21 +739,12 @@ fn initializeEmbedding(t: *FloatTensor) !void {
     var rng = std.Random.DefaultPrng.init(42);
     const random = rng.random();
 
-    // Initialize embedding layer uniformly between -0.02 and 0.02
-    const shape_dims = t.getDimensions();
-    var values = try t.asType(f32);
-    defer values.deinit();
-    
-    var total_elements: usize = 1;
-    for (shape_dims) |dim| {
-        total_elements *= dim;
-    }
-    
-    var data = try values.getData(f32);
-    
+        // Initialize embedding layer uniformly between -0.02 and 0.02
+    const total_elements = t.shape.numel();
+
     var i: usize = 0;
     while (i < total_elements) : (i += 1) {
-        data[i] = random.float(f32) * 0.04 - 0.02; // Range: [-0.02, 0.02]
+        t.data[i] = random.float(f32) * 0.04 - 0.02; // Range: [-0.02, 0.02]
     }
 }
 
@@ -750,28 +753,21 @@ fn initializeLinear(t: *FloatTensor) !void {
     var rng = std.Random.DefaultPrng.init(123);
     const random = rng.random();
 
-    // Xavier/Glorot initialization
-    const shape_dims = t.getDimensions();
-    var values = try t.asType(f32);
-    defer values.deinit();
-    
-    if (shape_dims.len != 2) return error.InvalidShape;
-    
+        // Xavier/Glorot initialization
+    const shape_dims = t.shape.dims;
+
+    if (t.shape.dims.len != 2) return error.InvalidShape;
+
     const fan_in = shape_dims[0];
     const fan_out = shape_dims[1];
     const std_dev = @sqrt(2.0 / @as(f32, @floatFromInt(fan_in + fan_out)));
-    
-    var total_elements: usize = 1;
-    for (shape_dims) |dim| {
-        total_elements *= dim;
-    }
-    
-    var data = try values.getData(f32);
-    
+
+    const total_elements = t.shape.numel();
+
     var i: usize = 0;
     while (i < total_elements) : (i += 1) {
         // Normal distribution with mean=0, std_dev calculated above
-        data[i] = random.floatNorm(f32) * std_dev;
+        t.data[i] = random.floatNorm(f32) * std_dev;
     }
 }
 

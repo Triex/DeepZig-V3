@@ -260,6 +260,9 @@ fn configureOptimizations(step: *std.Build.Step.Compile, optimize: std.builtin.O
 fn configureBlas(step: *std.Build.Step.Compile, target: std.Build.ResolvedTarget) void {
     const target_os = target.result.os.tag;
 
+    // Link libc for all targets since BLAS requires it
+    step.linkLibC();
+
     switch (target_os) {
         .macos => {
             // Use Apple's Accelerate framework

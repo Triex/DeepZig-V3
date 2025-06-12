@@ -172,7 +172,6 @@ pub fn Tensor(comptime dtype: TensorDType) type {
         data: []DataType,
         shape: TensorShape,
         allocator: Allocator,
-        blas_ctx: ?blas.Blas, // BLAS context for accelerated operations
 
         const Self = @This();
 
@@ -184,17 +183,10 @@ pub fn Tensor(comptime dtype: TensorDType) type {
             const shape = TensorShape{ .dims = owned_dims, .strides = strides };
             const data = try allocator.alloc(DataType, shape.numel());
 
-            // Initialize BLAS context for floating-point tensors
-            const blas_ctx = if (dtype == .f32 or dtype == .f64)
-                blas.Blas.init(allocator) catch null
-            else
-                null;
-
             return Self{
                 .data = data,
                 .shape = shape,
                 .allocator = allocator,
-                .blas_ctx = blas_ctx,
             };
         }
 
@@ -212,16 +204,10 @@ pub fn Tensor(comptime dtype: TensorDType) type {
                 return error.DataShapeMismatch;
             }
 
-            const blas_ctx = if (dtype == .f32 or dtype == .f64)
-                blas.Blas.init(allocator) catch null
-            else
-                null;
-
             return Self{
                 .data = data,
                 .shape = shape,
                 .allocator = allocator,
-                .blas_ctx = blas_ctx,
             };
         }
 
@@ -296,8 +282,14 @@ pub fn Tensor(comptime dtype: TensorDType) type {
                 return error.MatrixDimensionMismatch;
             }
 
-            // Use BLAS for floating-point matrices (1000x speedup!)
-            if (self.blas_ctx) |blas_context| {
+            // Use global BLAS for floating-point matrices (1000x speedup!)
+            if (DataType == f32 or DataType == f64) {
+                const blas_context = blas.Blas.global(self.allocator) catch {
+                    // Fallback when BLAS is not available
+                    try matmulNaive(self, other, result);
+                    return;
+                };
+
                 const dims = blas.MatrixDims{
                     .m = @intCast(m),
                     .n = @intCast(n),
@@ -313,13 +305,10 @@ pub fn Tensor(comptime dtype: TensorDType) type {
                         blas_context.matmul(f64, self.data, other.data, result.data, dims);
                         logDebug("✅ BLAS-accelerated f64 matrix multiplication: {}x{} * {}x{}", .{ m, k, k, n });
                     },
-                    else => {
-                        // Fallback to naive implementation for non-float types
-                        try matmulNaive(self, other, result);
-                    },
+                    else => unreachable, // We already checked for f32/f64 above
                 }
             } else {
-                // Fallback when BLAS is not available
+                // Fallback to naive implementation for non-float types
                 try matmulNaive(self, other, result);
             }
         }

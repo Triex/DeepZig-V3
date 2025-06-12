@@ -3,10 +3,12 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const ArrayList = std.ArrayList;
 
 const attention = @import("attention.zig");
 const Backend = @import("backend.zig").Backend;
-const FloatTensor = @import("tensor.zig").FloatTensor;
+const tensor = @import("tensor.zig");
+const FloatTensor = tensor.FloatTensor;
 const model = @import("model.zig");
 const moe = @import("moe.zig");
 
@@ -130,15 +132,15 @@ const SwiGLU = struct {
         @memcpy(output.data, output_reshaped.data);
     }
 
-    fn initializeLinear(tensor: *FloatTensor) void {
+    fn initializeLinear(linear_tensor: *FloatTensor) void {
         var rng = std.Random.DefaultPrng.init(std.crypto.random.int(u64));
         const random = rng.random();
 
-        const fan_in = tensor.shape.dims[0];
-        const fan_out = tensor.shape.dims[1];
+        const fan_in = linear_tensor.shape.dims[0];
+        const fan_out = linear_tensor.shape.dims[1];
         const limit = std.math.sqrt(6.0 / @as(f32, @floatFromInt(fan_in + fan_out)));
 
-        for (tensor.data) |*val| {
+        for (linear_tensor.data) |*val| {
             val.* = (random.float(f32) - 0.5) * 2.0 * limit;
         }
     }
@@ -332,6 +334,45 @@ pub const Transformer = struct {
             layer.deinit();
         }
         self.allocator.free(self.layers);
+    }
+
+    /// Returns an ArrayList containing all trainable parameters of the transformer
+    /// The caller owns the ArrayList but not the tensors within
+    pub fn parameters(self: *Self) !ArrayList(*tensor.Tensor(.f32)) {
+        var params = ArrayList(*tensor.Tensor(.f32)).init(self.allocator);
+        errdefer params.deinit();
+
+        // Add parameters from all transformer layers
+        for (self.layers) |*layer| {
+            // Add attention parameters
+            try params.append(&layer.attention_norm.weight);
+            try params.append(&layer.attention.q_proj);
+            try params.append(&layer.attention.k_proj);
+            try params.append(&layer.attention.v_proj);
+            try params.append(&layer.attention.o_proj);
+
+            // Add MLP norm parameters
+            try params.append(&layer.mlp_norm.weight);
+
+            // Add MLP or MoE parameters
+            if (layer.mlp) |*mlp| {
+                try params.append(&mlp.gate_proj);
+                try params.append(&mlp.up_proj);
+                try params.append(&mlp.down_proj);
+            }
+
+            if (layer.moe_layer) |*moe_instance| {
+                // Add MoE parameters
+                try params.append(&moe_instance.router);
+                // Add expert parameters
+                for (moe_instance.experts) |*expert| {
+                    try params.append(&expert.gate_proj);
+                    try params.append(&expert.down_proj);
+                }
+            }
+        }
+
+        return params;
     }
 
     /// Forward pass through all transformer layers

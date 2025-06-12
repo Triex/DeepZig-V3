@@ -221,7 +221,33 @@ pub const Blas = struct {
     performance_info: BlasPerformanceInfo,
     allocator: Allocator,
 
-    /// Initialize BLAS with optimal backend detection
+    /// Global singleton BLAS instance
+    var global_instance: ?Blas = null;
+    var init_mutex: std.Thread.Mutex = .{};
+
+    /// Get or create the global BLAS instance (thread-safe)
+    pub fn global(allocator: Allocator) !*const Blas {
+        init_mutex.lock();
+        defer init_mutex.unlock();
+
+        if (global_instance == null) {
+            const backend = BlasBackend.detectOptimal(allocator);
+            const performance_info = backend.getPerformanceInfo(allocator);
+
+            // Only log once for the global instance
+            logDebug("BLAS initialized with {} backend", .{backend});
+
+            global_instance = Blas{
+                .backend = backend,
+                .performance_info = performance_info,
+                .allocator = allocator,
+            };
+        }
+
+        return &global_instance.?;
+    }
+
+    /// Initialize BLAS with optimal backend detection (deprecated - use global() instead)
     pub fn init(allocator: Allocator) !Blas {
         const backend = BlasBackend.detectOptimal(allocator);
         const performance_info = backend.getPerformanceInfo(allocator);

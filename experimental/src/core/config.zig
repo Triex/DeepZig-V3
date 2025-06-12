@@ -141,6 +141,33 @@ pub const ModelConfig = struct {
 
         std.log.info("✅ Loaded config: {} layers, {} heads, {} hidden", .{ config.num_hidden_layers, config.num_attention_heads, config.hidden_size });
 
+        // ------------------------------------------------------------------
+        // Compatibility: DeepZig conversational models exported by the Python
+        // training pipeline (model_type "deepzig_conversational") do not
+        // include the MLA-specific head dimension fields used by the full
+        // DeepSeek-V3 architecture.  To keep one code path we map those
+        // simpler models onto the richer struct here.
+        // ------------------------------------------------------------------
+        if (root.get("model_type")) |mt_val| {
+            const mt_str = mt_val.string;
+            if (std.mem.eql(u8, mt_str, "deepzig_conversational")) {
+                // For the conversational architecture we treat all Q/K/V heads
+                // as standard RoPE heads with dimension hidden_size / heads.
+                const head_dim = config.hidden_size / config.num_attention_heads;
+                // Store a static literal to avoid dangling pointer after JSON
+                config.model_type = "deepzig_conversational";
+
+                // Use purely RoPE heads
+                config.qk_nope_head_dim = 0;
+                config.qk_rope_head_dim = head_dim;
+                config.v_head_dim = head_dim;
+
+                // Disable MoE by default for this lightweight model
+                config.num_experts = 1;
+                config.num_experts_per_token = 1;
+            }
+        }
+
         return config;
     }
 
@@ -195,7 +222,7 @@ pub const ModelConfig = struct {
             .moe_intermediate_size = 512,
         };
     }
-    
+
     /// Configuration for the medium-sized model
     /// Returns a heap-allocated config that must be freed with deinit()
     pub fn mediumConfig(allocator: Allocator) !*ModelConfig {
@@ -219,7 +246,7 @@ pub const ModelConfig = struct {
         };
         return config;
     }
-    
+
     /// Free a heap-allocated config
     pub fn deinit(self: *ModelConfig) void {
         _ = self; // Currently unused, but kept for API consistency

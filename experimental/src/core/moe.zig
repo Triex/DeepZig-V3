@@ -145,15 +145,14 @@ pub const Expert = struct {
 
     /// Xavier/Glorot uniform initialization for linear layers
     fn initializeLinear(tensor: *FloatTensor) void {
-        var rng = std.Random.DefaultPrng.init(std.crypto.random.int(u64));
-        const random = rng.random();
-
+        var prng = std.Random.DefaultPrng.init(std.crypto.random.int(u64));
+        const rng = prng.random();
         const fan_in = tensor.shape.dims[0];
         const fan_out = tensor.shape.dims[1];
         const limit = math.sqrt(6.0 / @as(f32, @floatFromInt(fan_in + fan_out)));
 
         for (tensor.data) |*val| {
-            val.* = (random.float(f32) - 0.5) * 2.0 * limit;
+            val.* = (rng.float(f32) - 0.5) * 2.0 * limit;
         }
     }
 };

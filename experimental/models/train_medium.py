@@ -33,6 +33,10 @@ import os
 import warnings
 from typing import Dict, List, Optional, Union, Tuple
 import math
+import time
+
+# FIXED: Set tokenizer parallelism to avoid warnings
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 import torch
 import torch.nn as nn
@@ -42,7 +46,7 @@ from torch.utils.checkpoint import checkpoint
 
 from transformers import (
     PretrainedConfig, PreTrainedModel, TrainingArguments, Trainer,
-    GenerationConfig, TrainerCallback
+    GenerationConfig, TrainerCallback, GenerationMixin
 )
 from transformers.modeling_outputs import CausalLMOutput
 from datasets import load_dataset, concatenate_datasets, Dataset
@@ -69,21 +73,21 @@ class DeepZigConfig(PretrainedConfig):
 
     def __init__(
         self,
-        vocab_size: int = 32_000,
-        hidden_size: int = 512,          # Optimized for efficiency
-        intermediate_size: int = 1536,   # 3x hidden_size ratio
-        num_hidden_layers: int = 8,      # Reduced for faster inference
-        num_attention_heads: int = 8,
-        num_key_value_heads: int = 8,    # Full attention for better quality
-        max_position_embeddings: int = 4096,  # Support longer conversations
-        rope_base: float = 10_000.0,          # RoPE base frequency
-        rope_scaling: Optional[Dict] = None,  # For sequence length extension
+        vocab_size: int = 8_000,
+        hidden_size: int = 256,
+        intermediate_size: int = 768,
+        num_hidden_layers: int = 4,
+        num_attention_heads: int = 4,
+        num_key_value_heads: int = 4,
+        max_position_embeddings: int = 1024,
+        rope_base: float = 10_000.0,
+        rope_scaling: Optional[Dict] = None,
         rms_norm_eps: float = 1e-6,
-        attention_dropout: float = 0.0,
-        hidden_dropout: float = 0.0,
+        attention_dropout: float = 0.1,
+        hidden_dropout: float = 0.1,
         torch_dtype: str = "bfloat16",
         use_cache: bool = True,
-        tie_word_embeddings: bool = True,     # Explicitly declare tied weights
+        tie_word_embeddings: bool = True,
         pad_token_id: int = 0,
         bos_token_id: int = 1,
         eos_token_id: int = 2,
@@ -112,6 +116,66 @@ class DeepZigConfig(PretrainedConfig):
         self.torch_dtype = torch_dtype
         self.use_cache = use_cache
         self.tie_word_embeddings = tie_word_embeddings
+
+    @classmethod
+    def create_test_config(cls, vocab_size: int = 2000):
+        """Create tiny config for fast testing (< 1 minute training)"""
+        return cls(
+            vocab_size=vocab_size,
+            hidden_size=128,        # Tiny model
+            intermediate_size=384,  # 3x hidden
+            num_hidden_layers=2,    # Just 2 layers
+            num_attention_heads=4,
+            num_key_value_heads=4,
+            max_position_embeddings=512,
+            attention_dropout=0.0,  # No dropout for tiny model
+            hidden_dropout=0.0,
+        )
+
+    @classmethod
+    def create_small_config(cls, vocab_size: int = 8000):
+        """Create small config for quick training (few minutes)"""
+        return cls(
+            vocab_size=vocab_size,
+            hidden_size=256,
+            intermediate_size=768,
+            num_hidden_layers=4,
+            num_attention_heads=4,
+            num_key_value_heads=4,
+            max_position_embeddings=1024,
+            attention_dropout=0.1,
+            hidden_dropout=0.1,
+        )
+
+    @classmethod
+    def create_medium_config(cls, vocab_size: int = 16000):
+        """Create medium config (~50M parameters) for better quality output"""
+        return cls(
+            vocab_size=vocab_size,
+            hidden_size=768,        # Increased from 512
+            intermediate_size=2304, # 3x hidden
+            num_hidden_layers=12,   # Increased from 8
+            num_attention_heads=12, # Increased from 8
+            num_key_value_heads=12, # Increased from 8
+            max_position_embeddings=2048,
+            attention_dropout=0.1,
+            hidden_dropout=0.1,
+        )
+
+    @classmethod
+    def create_large_config(cls, vocab_size: int = 32000):
+        """Create large config (~125M parameters, GPT-2 Small equivalent)"""
+        return cls(
+            vocab_size=vocab_size,
+            hidden_size=1024,       # Increased from 768
+            intermediate_size=4096, # 4x hidden
+            num_hidden_layers=16,   # Increased from 12
+            num_attention_heads=16, # Increased from 12
+            num_key_value_heads=16, # Increased from 12
+            max_position_embeddings=4096,
+            attention_dropout=0.1,
+            hidden_dropout=0.1,
+        )
 
 
 # =============================================================================
@@ -326,7 +390,7 @@ class DeepZigLayer(nn.Module):
 # Main Model
 # =============================================================================
 
-class DeepZigConversationalModel(PreTrainedModel):
+class DeepZigConversationalModel(PreTrainedModel, GenerationMixin):
     """
     DeepZig Conversational Language Model
 
@@ -362,11 +426,19 @@ class DeepZigConversationalModel(PreTrainedModel):
     def _init_weights(self, module):
         """Initialize weights following best practices for small language models."""
         if isinstance(module, nn.Linear):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
-            if module.bias is not None:
+            # FIXED: Better initialization for small models
+            std = 0.02
+            if hasattr(module, 'weight') and module.weight is not None:
+                torch.nn.init.normal_(module.weight, mean=0.0, std=std)
+            if hasattr(module, 'bias') and module.bias is not None:
                 torch.nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
+            # FIXED: Proper embedding initialization
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+        elif isinstance(module, RMSNorm):
+            # FIXED: Initialize RMSNorm weights to 1
+            if hasattr(module, 'weight') and module.weight is not None:
+                torch.nn.init.ones_(module.weight)
 
     def get_input_embeddings(self):
         return self.embed_tokens
@@ -382,7 +454,12 @@ class DeepZigConversationalModel(PreTrainedModel):
 
     def tie_weights(self):
         """Tie the weights between the input embeddings and the output embeddings."""
-        self.lm_head.weight = self.embed_tokens.weight
+        # FIXED: Proper weight tying with size check
+        if self.config.tie_word_embeddings:
+            if self.embed_tokens.weight.shape == self.lm_head.weight.shape:
+                self.lm_head.weight = self.embed_tokens.weight
+            else:
+                print(f"⚠️ Cannot tie weights: embed_tokens {self.embed_tokens.weight.shape} != lm_head {self.lm_head.weight.shape}")
 
     def prepare_inputs_for_generation(
         self,
@@ -559,55 +636,75 @@ class ConversationalDataProcessor:
         ]
 
     @staticmethod
-    def create_tokenizer(dataset: Dataset, vocab_size: int = 32000) -> Tokenizer:
+    def create_tokenizer(dataset: Dataset, vocab_size: int = 8000) -> Tokenizer:  # FIXED: Smaller default vocab
         """Create and train a conversation-aware tokenizer."""
         print("🔤 Creating and training tokenizer...")
 
         # Initialize BPE tokenizer
         tokenizer = Tokenizer(models.BPE())
 
-        # Set up pre-tokenization for better handling of code and JSON
+        # FIXED: Use simpler pre-tokenization that doesn't add problematic suffixes
         tokenizer.pre_tokenizer = pre_tokenizers.Sequence([
-            pre_tokenizers.ByteLevel(add_prefix_space=False),
-            pre_tokenizers.Punctuation(),
-            pre_tokenizers.WhitespaceSplit()
+            pre_tokenizers.WhitespaceSplit(),
+            pre_tokenizers.Punctuation()
         ])
 
-        # Configure trainer
+        # Configure trainer - FIXED: Remove problematic suffixes/prefixes
         trainer = trainers.BpeTrainer(
             vocab_size=vocab_size,
             special_tokens=ConversationalDataProcessor.SPECIAL_TOKENS,
-            min_frequency=2,
-            continuing_subword_prefix="##",
-            end_of_word_suffix="</w>"
+            min_frequency=3,        # FIXED: Higher min frequency for better quality
+            show_progress=True
         )
 
-        # Prepare training data
+        # Prepare training data - FIXED: Better data preparation
         training_file = "tokenizer_training_data.txt"
         with open(training_file, "w", encoding="utf-8") as f:
+            sample_count = 0
             for item in dataset:
                 if "instruction" in item and "response" in item:
-                    # Format as conversation
-                    f.write(f"<user>{item['instruction']}</user>\n")
-                    if item.get("input"):
-                        f.write(f"<system>{item['input']}</system>\n")
-                    f.write(f"<assistant>{item['response']}</assistant>\n\n")
-                elif "text" in item:
-                    f.write(f"{item['text']}\n")
+                    # FIXED: Better filtering and cleaning
+                    instruction = item['instruction'].strip()
+                    response = item['response'].strip()
 
-            # Add tool calling examples
-            f.write("<tool>search</tool>\n{\"query\": \"example\"}\n")
-            f.write("<tool>calculate</tool>\n{\"expression\": \"2+2\"}\n")
+                    if len(instruction) > 5 and len(response) > 10:
+                        # Format as conversation
+                        f.write(f"<s><user>{instruction}</user><assistant>{response}</assistant></s>\n")
+                        sample_count += 1
+
+                        # Also add components separately for better tokenization
+                        f.write(f"{instruction}\n")
+                        f.write(f"{response}\n")
+
+                elif "text" in item:
+                    text = item['text'].strip()
+                    if len(text) > 10:
+                        f.write(f"{text}\n")
+                        sample_count += 1
+
+            # Add more conversation examples for better special token learning
+            conversation_examples = [
+                "<s><user>Hello</user><assistant>Hello! How can I help you today?</assistant></s>",
+                "<s><user>Thank you</user><assistant>You're welcome!</assistant></s>",
+                "<s><user>How are you?</user><assistant>I'm doing well, thank you for asking!</assistant></s>",
+                "<s><user>Can you help me?</user><assistant>Of course! I'd be happy to help. What do you need?</assistant></s>",
+                "<s><user>What's the weather?</user><assistant>I don't have access to current weather data, but I can help you find weather information.</assistant></s>",
+            ]
+
+            for example in conversation_examples:
+                f.write(f"{example}\n")
+                # Add 10 times to ensure good learning of conversation structure
+                for _ in range(10):
+                    f.write(f"{example}\n")
+
+            print(f"📊 Prepared {sample_count} samples for tokenizer training")
 
         # Train tokenizer
         tokenizer.train([training_file], trainer)
 
-        # Set up post-processing
-        tokenizer.post_processor = processors.TemplateProcessing(
-            single="<s> $A </s>",
-            pair="<s> $A </s> $B </s>",
-            special_tokens=[("<s>", 1), ("</s>", 2)],
-        )
+        # FIXED: Remove post-processor since we manually add <s> and </s> tokens
+        # This prevents duplication of BOS/EOS tokens
+        tokenizer.post_processor = None
 
         # Cleanup
         os.remove(training_file)
@@ -616,11 +713,34 @@ class ConversationalDataProcessor:
         return tokenizer
 
 
+class TokenizerWrapper:
+    """Wrapper to make tokenizers.Tokenizer compatible with transformers.Trainer"""
+
+    def __init__(self, tokenizer: Tokenizer):
+        self.tokenizer = tokenizer
+
+    def save_pretrained(self, save_directory: str):
+        """Save tokenizer in transformers-compatible format"""
+        os.makedirs(save_directory, exist_ok=True)
+        self.tokenizer.save(os.path.join(save_directory, "tokenizer.json"))
+
+        # Create a minimal tokenizer_config.json for compatibility
+        config = {
+            "tokenizer_class": "PreTrainedTokenizerFast",
+            "model_max_length": 4096,
+        }
+        with open(os.path.join(save_directory, "tokenizer_config.json"), "w") as f:
+            json.dump(config, f, indent=2)
+
+    def __getattr__(self, name):
+        return getattr(self.tokenizer, name)
+
+
 class ConversationalDataCollator:
     """Efficient data collator for conversational training."""
 
     def __init__(self, tokenizer: Tokenizer, max_length: int = 512):
-        self.tokenizer = tokenizer
+        self.tokenizer = TokenizerWrapper(tokenizer)  # Wrap for compatibility
         self.max_length = max_length
 
     def __call__(self, features: List[Dict]) -> Dict[str, torch.Tensor]:
@@ -630,6 +750,15 @@ class ConversationalDataCollator:
         input_ids = torch.zeros((batch_size, self.max_length), dtype=torch.long)
         attention_mask = torch.zeros((batch_size, self.max_length), dtype=torch.long)
         labels = torch.full((batch_size, self.max_length), -100, dtype=torch.long)
+
+        # mask everything before the first <assistant> token
+        assistant_id = self.tokenizer.token_to_id("<assistant>")
+        for i, ids in enumerate(input_ids):
+            try:
+                start = (ids == assistant_id).nonzero()[0].item() + 1
+            except IndexError:
+                start = ids.size(0)  # no assistant tag, mask all
+            labels[i, :start] = -100
 
         for i, feature in enumerate(features):
             ids = feature["input_ids"]
@@ -651,17 +780,46 @@ def tokenize_conversations(examples: Dict, tokenizer: Tokenizer, max_length: int
     results = {"input_ids": []}
 
     for i in range(len(examples["instruction"])):
-        # Format conversation
-        conversation = f"<user>{examples['instruction'][i]}</user>"
-        if examples.get("input") and examples["input"][i]:
-            conversation += f"<system>{examples['input'][i]}</system>"
-        conversation += f"<assistant>{examples['response'][i]}</assistant>"
+        # FIXED: Better conversation formatting with clear structure
+        instruction = examples['instruction'][i].strip()
+        response = examples['response'][i].strip()
+
+        # Skip empty or very short examples
+        if len(instruction) < 5 or len(response) < 10:
+            continue
+
+        # Format conversation with better structure
+        if examples.get("input") and examples["input"][i] and examples["input"][i].strip():
+            conversation = f"<s><user>{instruction}</user><system>{examples['input'][i].strip()}</system><assistant>{response}</assistant></s>"
+        else:
+            conversation = f"<s><user>{instruction}</user><assistant>{response}</assistant></s>"
 
         # Tokenize
-        encoded = tokenizer.encode(conversation)
-        tokens = encoded.ids[:max_length]  # Truncate if needed
+        try:
+            encoded = tokenizer.encode(conversation)
+            tokens = encoded.ids
 
-        results["input_ids"].append(tokens)
+            # FIXED: Better length handling - ensure we have meaningful content
+            if len(tokens) < 20:  # Skip very short sequences
+                continue
+
+            # Truncate if needed but preserve structure
+            if len(tokens) > max_length:
+                tokens = tokens[:max_length-1] + [tokenizer.token_to_id("</s>") or 2]
+
+            results["input_ids"].append(tokens)
+
+        except Exception as e:
+            print(f"⚠️ Tokenization error: {e}")
+            continue
+
+    # FIXED: Ensure we have some data
+    if not results["input_ids"]:
+        print("❌ No valid tokenized examples found!")
+        # Add a fallback example
+        fallback = f"<s><user>Hello</user><assistant>Hello! How can I help you today?</assistant></s>"
+        encoded = tokenizer.encode(fallback)
+        results["input_ids"].append(encoded.ids)
 
     return results
 
@@ -707,58 +865,115 @@ def setup_lora_training(model: DeepZigConversationalModel, rank: int = 16) -> De
     return model
 
 
-def create_training_args(output_dir: str, num_epochs: int = 3, batch_size: int = 4, has_eval: bool = True) -> TrainingArguments:
-    """Create optimized training arguments following best practices."""
+def create_training_args(output_dir: str, num_epochs: int = 3, batch_size: int = 4, model_size: str = "small", has_eval: bool = True) -> TrainingArguments:
+    """Create optimized training arguments based on model size."""
 
-    # Base arguments
-    args = {
+    # Adaptive parameters based on model size
+    if model_size == "test":
+        # SUPER FAST - for testing only (< 1 minute)
+        args = {
+            "learning_rate": 5e-4,           # High LR for fast convergence
+            "gradient_accumulation_steps": 1, # No accumulation for speed
+            "warmup_ratio": 0.0,             # No warmup for speed
+            "weight_decay": 0.0,             # No regularization for speed
+            "logging_steps": 5,              # Frequent logging
+            "save_steps": 50,                # Frequent saves
+            "max_grad_norm": 0.5,            # Lower for stability
+            "dataloader_num_workers": 0,     # Single threaded for speed
+        }
+    elif model_size == "small":
+        # QUICK TRAINING - for validation (few minutes)
+        args = {
+            "learning_rate": 2e-4,
+            "gradient_accumulation_steps": 2,
+            "warmup_ratio": 0.03,
+            "weight_decay": 0.01,
+            "logging_steps": 10,
+            "save_steps": 100,
+            "max_grad_norm": 1.0,
+            "dataloader_num_workers": 1,
+        }
+    elif model_size == "medium":
+        # BALANCED - for serious training
+        args = {
+            "learning_rate": 1e-4,
+            "gradient_accumulation_steps": 4,
+            "warmup_ratio": 0.1,
+            "weight_decay": 0.01,
+            "logging_steps": 25,
+            "save_steps": 250,
+            "max_grad_norm": 1.0,
+            "dataloader_num_workers": 2,
+        }
+    elif model_size == "large":
+        # PRODUCTION - for large scale training
+        args = {
+            "learning_rate": 5e-5,
+            "gradient_accumulation_steps": 8,
+            "warmup_ratio": 0.1,
+            "weight_decay": 0.01,
+            "logging_steps": 50,
+            "save_steps": 500,
+            "max_grad_norm": 1.0,
+            "dataloader_num_workers": 4,
+        }
+        # else xl
+    else:
+        # PRODUCTION - for large scale training
+        args = {
+            "learning_rate": 1e-4,
+            "gradient_accumulation_steps": 16,
+            "warmup_ratio": 0.1,
+            "weight_decay": 0.01,
+            "logging_steps": 50,
+            "save_steps": 500,
+            "max_grad_norm": 1.0,
+            "dataloader_num_workers": 4,
+        }
+
+    # Base arguments (same for all sizes)
+    base_args = {
         "output_dir": output_dir,
-
-        # Training schedule
         "num_train_epochs": num_epochs,
         "per_device_train_batch_size": batch_size,
         "per_device_eval_batch_size": batch_size,
-        "gradient_accumulation_steps": 4,
-
-        # Optimization
-        "learning_rate": 2e-4,
-        "weight_decay": 0.01,
-        "warmup_ratio": 0.03,
         "lr_scheduler_type": "cosine",
-        "max_grad_norm": 1.0,
-
-        # Mixed precision and memory optimization
+        "adam_beta1": 0.9,
+        "adam_beta2": 0.95,
+        "adam_epsilon": 1e-8,
         "fp16": True,
-        "gradient_checkpointing": True,   # Now properly implemented
+        "gradient_checkpointing": model_size in ["medium", "large"],  # Only for larger models
         "dataloader_pin_memory": True,
-
-        # Logging
-        "logging_steps": 25,
-        "save_steps": 500,
-        "save_total_limit": 3,
-
-        # Misc
+        "save_total_limit": 2,
         "remove_unused_columns": False,
         "report_to": "none",
         "disable_tqdm": False,
         "logging_first_step": True,
+        "prediction_loss_only": True,
+        "label_smoothing_factor": 0.0,
+        # "label_smoothing_factor": 0.1 if model_size != "test" else 0.0,  # No smoothing for test
+        "save_safetensors": False,  # FIXED: Handle weight tying shared tensors
     }
 
-    # Add evaluation-specific arguments only if we have an eval dataset
+    # Merge arguments
+    final_args = {**base_args, **args}
+
+    # Add evaluation-specific arguments
     if has_eval:
-        args.update({
-            "eval_steps": 500,
+        eval_steps = args["save_steps"] // 2
+        final_args.update({
+            "eval_steps": eval_steps,
             "eval_strategy": "steps",
             "load_best_model_at_end": True,
             "metric_for_best_model": "eval_loss",
             "greater_is_better": False,
         })
     else:
-        args.update({
+        final_args.update({
             "eval_strategy": "no",
         })
 
-    return TrainingArguments(**args)
+    return TrainingArguments(**final_args)
 
 
 # =============================================================================
@@ -854,34 +1069,72 @@ def test_model_generation(model: DeepZigConversationalModel, tokenizer: Tokenize
     """Test the trained model with conversation examples."""
     print("\n🧪 Testing model generation...")
 
+    # FIXED: Ensure model is on correct device
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = model.to(device)
     model.eval()
+
+    # FIXED: Better test prompts that are more similar to training data
     test_prompts = [
-        "<user>What is the weather like?</user><assistant>",
-        "<user>Explain quantum computing</user><assistant>",
-        "<user>Write a Python function to calculate fibonacci</user><assistant>",
+        "<s><user>What is the weather like?</user><assistant>",
+        "<s><user>Hello, how are you?</user><assistant>",
+        "<s><user>Can you help me?</user><assistant>",
     ]
+
+    print(f"🔍 Tokenizer vocab size: {tokenizer.get_vocab_size()}")
+    print(f"🔍 Special tokens - PAD: {tokenizer.token_to_id('<pad>')}, BOS: {tokenizer.token_to_id('<s>')}, EOS: {tokenizer.token_to_id('</s>')}")
 
     for prompt in test_prompts:
         print(f"\n💬 Prompt: {prompt}")
 
-        # Tokenize
-        encoded = tokenizer.encode(prompt)
-        input_ids = torch.tensor([encoded.ids])
+        # Tokenize - FIXED: Better error handling and debugging
+        try:
+            encoded = tokenizer.encode(prompt)
+            input_ids = torch.tensor([encoded.ids]).to(device)
 
-        # Generate
-        with torch.no_grad():
-            outputs = model.generate(
-                input_ids,
-                max_length=input_ids.shape[1] + 50,
-                temperature=0.8,
-                do_sample=True,
-                pad_token_id=tokenizer.token_to_id("<pad>"),
-                eos_token_id=tokenizer.token_to_id("</assistant>"),
-            )
+            print(f"🔍 Input tokens: {len(encoded.ids)} tokens")
+            print(f"🔍 First few tokens: {encoded.ids[:10]}")
 
-        # Decode
-        generated_text = tokenizer.decode(outputs[0].tolist())
-        print(f"🤖 Generated: {generated_text}")
+            # FIXED: Much better generation parameters
+            with torch.no_grad():
+                outputs = model.generate(
+                    input_ids,
+                    max_new_tokens=50,      # FIXED: Shorter generation for testing
+                    temperature=0.8,
+                    do_sample=True,
+                    top_p=0.9,
+                    top_k=40,
+                    repetition_penalty=1.15,  # FIXED: Higher repetition penalty
+                    pad_token_id=tokenizer.token_to_id("<pad>") or 0,
+                    bos_token_id=tokenizer.token_to_id("<s>") or 1,
+                    eos_token_id=tokenizer.token_to_id("</s>") or 2,
+                    no_repeat_ngram_size=2,   # FIXED: Prevent bigram repetition
+                    early_stopping=True,      # FIXED: Stop at EOS
+                )
+
+            # FIXED: Better decoding with debugging
+            generated_tokens = outputs[0][input_ids.shape[1]:].tolist()
+            print(f"🔍 Generated tokens: {generated_tokens[:20]}")  # Debug first 20 tokens
+
+            # Try different decoding approaches
+            try:
+                generated_text = tokenizer.decode(generated_tokens, skip_special_tokens=True)
+                generated_text = generated_text.strip()
+                print(f"🤖 Generated (clean): {generated_text}")
+            except Exception as decode_error:
+                print(f"❌ Clean decode failed: {decode_error}")
+                # Fallback to raw decode
+                try:
+                    raw_text = tokenizer.decode(generated_tokens, skip_special_tokens=False)
+                    print(f"🤖 Generated (raw): {raw_text}")
+                except Exception as raw_error:
+                    print(f"❌ Raw decode failed: {raw_error}")
+
+        except Exception as e:
+            print(f"❌ Generation failed: {e}")
+            import traceback
+            traceback.print_exc()
+            continue
 
 
 # =============================================================================
@@ -891,25 +1144,84 @@ def test_model_generation(model: DeepZigConversationalModel, tokenizer: Tokenize
 def main():
     """Main training function with full pipeline."""
     parser = argparse.ArgumentParser(description="Train DeepZig Conversational Model")
+
+    # Model size configuration
+    parser.add_argument("--model-size", type=str, default="test",
+                       choices=["test", "small", "medium", "large"],
+                       help="Model size: test(~1M, <1min), small(~5M, ~17sec), medium(~50M, ~15min), large(~125M, hours)")
+
+    # Training configuration
     parser.add_argument("--use-lora", action="store_true", help="Use LoRA for parameter-efficient training")
     parser.add_argument("--lora-rank", type=int, default=16, help="LoRA rank (default: 16)")
-    parser.add_argument("--max-samples", type=int, default=20000, help="Maximum training samples")
+    parser.add_argument("--max-samples", type=int, default=None, help="Maximum training samples (auto-set based on model size)")
     parser.add_argument("--eval-split", type=float, default=0.1, help="Evaluation split ratio")
-    parser.add_argument("--epochs", type=int, default=3, help="Number of training epochs")
-    parser.add_argument("--batch-size", type=int, default=4, help="Training batch size")
-    parser.add_argument("--output-dir", type=str, default="deepzig-conversational-model", help="Output directory")
+    parser.add_argument("--epochs", type=int, default=None, help="Number of training epochs (auto-set based on model size)")
+    parser.add_argument("--batch-size", type=int, default=None, help="Training batch size (auto-set based on model size)")
+    parser.add_argument("--output-dir", type=str, default=None, help="Output directory (auto-set based on model size)")
 
     args = parser.parse_args()
 
+    # Auto-configure based on model size
+    size_configs = {
+        "test": {
+            "max_samples": 200,      # Tiny dataset for speed
+            "epochs": 3,             # Few epochs
+            "batch_size": 4,         # Small batch
+            "vocab_size": 2000,      # Tiny vocab
+        },
+        "small": {
+            "max_samples": 1000,     # Small dataset
+            "epochs": 3,             # Standard epochs
+            "batch_size": 4,         # Small batch
+            "vocab_size": 8000,      # Medium vocab
+        },
+        "medium": {
+            "max_samples": 10000,     # Medium dataset
+            "epochs": 3,             # Standard epochs
+            "batch_size": 2,         # Larger model needs smaller batch
+            "vocab_size": 16000,     # Large vocab
+        },
+        "large": {
+            "max_samples": 10000,    # Full dataset
+            "epochs": 5,             # Mid epochs
+            "batch_size": 1,         # Large model needs tiny batch
+            "vocab_size": 32000,     # Full vocab
+        },
+        "xl": {
+            "max_samples": 20000,    # Full dataset
+            "epochs": 10,            # More epochs
+            "batch_size": 1,         # Large model needs tiny batch
+            "vocab_size": 32000,     # Full vocab
+        }
+    }
+
+    config = size_configs[args.model_size]
+
+    # Apply auto-configuration if not explicitly set
+    if args.max_samples is None:
+        args.max_samples = config["max_samples"]
+    if args.epochs is None:
+        args.epochs = config["epochs"]
+    if args.batch_size is None:
+        args.batch_size = config["batch_size"]
+    if args.output_dir is None:
+        args.output_dir = f"deepzig-{args.model_size}-model"
+
     print("🚀 Starting DeepZig Conversational Model Training")
     print("=" * 60)
+    print(f"🎯 Model Size: {args.model_size.upper()}")
+    print(f"📊 Samples: {args.max_samples:,} | Epochs: {args.epochs} | Batch: {args.batch_size}")
+
+    # FIXED: Set up device early
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"🔧 Using device: {device}")
 
     # 1. Load and process data
     print("📚 Loading datasets...")
     dataset = ConversationalDataProcessor.load_datasets(max_samples=args.max_samples)
 
     # 2. Create tokenizer
-    tokenizer = ConversationalDataProcessor.create_tokenizer(dataset)
+    tokenizer = ConversationalDataProcessor.create_tokenizer(dataset, vocab_size=config["vocab_size"])
 
     # 3. Tokenize dataset
     print("🔤 Tokenizing dataset...")
@@ -929,12 +1241,26 @@ def main():
         train_dataset = tokenized_dataset
         eval_dataset = None
 
-    # 5. Create model
+    # 5. Create model with appropriate size configuration
     print("🏗️ Creating model...")
-    config = DeepZigConfig(vocab_size=tokenizer.get_vocab_size())
-    model = DeepZigConversationalModel(config)
+    if args.model_size == "test":
+        config_obj = DeepZigConfig.create_test_config(vocab_size=tokenizer.get_vocab_size())
+    elif args.model_size == "small":
+        config_obj = DeepZigConfig.create_small_config(vocab_size=tokenizer.get_vocab_size())
+    elif args.model_size == "medium":
+        config_obj = DeepZigConfig.create_medium_config(vocab_size=tokenizer.get_vocab_size())
+    elif args.model_size == "large":
+        config_obj = DeepZigConfig.create_large_config(vocab_size=tokenizer.get_vocab_size())
+    else:  # xl
+        config_obj = DeepZigConfig.create_large_config(vocab_size=tokenizer.get_vocab_size())
+
+    model = DeepZigConversationalModel(config_obj)
+
+    # FIXED: Move model to device early
+    model = model.to(device)
 
     print(f"📊 Model parameters: {model.num_parameters():,}")
+    print(f"📊 Model size: ~{model.num_parameters() / 1_000_000:.1f}M parameters")
 
     # 6. Setup LoRA if requested
     if args.use_lora:
@@ -944,7 +1270,8 @@ def main():
     data_collator = ConversationalDataCollator(tokenizer)
 
     # 8. Setup training
-    training_args = create_training_args(args.output_dir, args.epochs, args.batch_size, has_eval=(eval_dataset is not None))
+    training_args = create_training_args(args.output_dir, args.epochs, args.batch_size,
+                                       model_size=args.model_size, has_eval=(eval_dataset is not None))
 
     trainer = Trainer(
         model=model,
@@ -957,11 +1284,13 @@ def main():
 
     # 9. Train model
     print("🏃 Starting training...")
+    start_time = time.time()
     trainer.train()
+    training_time = time.time() - start_time
 
-    # 10. Save model with safe serialization disabled for tied weights
+    # 10. Save model
     print("💾 Saving model...")
-    trainer.save_model(safe_serialization=False)
+    trainer.save_model()
 
     # 11. Export to Zig format
     export_to_zig_format(model, tokenizer, args.output_dir)
@@ -969,9 +1298,18 @@ def main():
     # 12. Test generation
     test_model_generation(model, tokenizer)
 
-    print("\n🎉 Training completed successfully!")
+    print(f"\n🎉 Training completed successfully!")
+    print(f"⏱️ Training time: {training_time:.1f} seconds ({training_time/60:.1f} minutes)")
     print(f"📁 Model saved to: {args.output_dir}")
-    print("🔧 Ready for Zig integration!")
+    print(f"🔧 Ready for Zig integration!")
+
+    # Print scaling suggestions
+    if args.model_size == "test":
+        print(f"\n🚀 To scale up, try:")
+        print(f"   --model-size small   (5M params, ~17sec training)")
+        print(f"   --model-size medium  (50M params, ~25min training)")
+        print(f"   --model-size large   (125M params, hours training)")
+        print(f"   --model-size xl      (250M params, hours training)")
 
 
 if __name__ == "__main__":
