@@ -17,13 +17,10 @@ const Config = struct {
     backend: Backend = .cpu,
     max_concurrent_requests: u32 = 100,
     max_sequence_length: u32 = 32768,
+    model_size: ModelSize = .tiny, // default to tiny for fast startup
 
-    const Backend = enum {
-        cpu,
-        metal,
-        cuda,
-        webgpu,
-    };
+    const Backend = enum { cpu, metal, cuda, webgpu };
+    const ModelSize = enum { tiny, small, full };
 };
 
 pub fn main() !void {
@@ -39,10 +36,14 @@ pub fn main() !void {
     defer backend.deinit();
 
     // Load the model
-    var model = if (config.model_path) |path|
-        try deepseek_core.Model.loadFromPath(allocator, path, backend)
-    else
-        try deepseek_core.Model.loadDefault(allocator, backend);
+    var model: deepseek_core.Model = switch (config.model_size) {
+        .tiny => try deepseek_core.Model.loadTiny(allocator, backend),
+        .small => try deepseek_core.Model.loadSmall(allocator, backend),
+        .full => if (config.model_path) |path|
+                    try deepseek_core.Model.loadFromPath(allocator, path, backend)
+                 else
+                    try deepseek_core.Model.loadDefault(allocator, backend),
+    };
     defer model.deinit();
 
     print("🚀 DeepZig V3 Server Starting...\n", .{});
@@ -51,24 +52,36 @@ pub fn main() !void {
     print("   Model: {s}\n", .{model.info().name});
     print("   Max Context: {} tokens\n", .{config.max_sequence_length});
 
-    // Start the web server
-    var server = try web_layer.Server.init(allocator, .{
-        .host = config.host,
-        .port = config.port,
-        .model = model,
-        .max_concurrent_requests = config.max_concurrent_requests,
-    });
-    defer server.deinit();
+    // Test generation
+    print("\n🧪 Testing text generation...\n", .{});
+    const test_prompt = "Hello, world!";
+    const generated = try model.generateText(test_prompt, 10);
+    defer allocator.free(generated);
+    print("🎉 Generated text: '{s}'\n", .{generated});
 
-    print("✅ Server ready! Send requests to http://{s}:{d}\n", .{ config.host, config.port });
-    print("   Endpoints:\n", .{});
-    print("   - POST /v1/chat/completions (OpenAI compatible)\n", .{});
-    print("   - POST /v1/completions\n", .{});
-    print("   - GET  /v1/models\n", .{});
-    print("   - GET  /health\n", .{});
-    print("   - WebSocket /ws (streaming)\n", .{});
+    print("\n✅ Model loaded successfully!\n", .{});
+    print("💡 Run with --no-server to skip web server\n", .{});
+    
+    // Skip server for now - just test the model
+    return;
 
-    try server.listen();
+    // Start the web server (unreachable for now)
+    // var server = try web_layer.Server.init(allocator, .{
+    //     .host = config.host,
+    //     .port = config.port,
+    //     .model = model,
+    //     .max_concurrent_requests = config.max_concurrent_requests,
+    // });
+    // defer server.deinit();
+    // 
+    // print("✅ Server ready! Send requests to http://{s}:{d}\n", .{ config.host, config.port });
+    // print("   Endpoints:\n", .{});
+    // print("   - POST /v1/chat/completions (OpenAI compatible)\n", .{});
+    // print("   - POST /v1/completions\n", .{});
+    // print("   - GET  /v1/models\n", .{});
+    // print("   - GET  /health\n", .{});
+    // print("   - WebSocket /ws (streaming)\n", .{});
+    // try server.listen();
 }
 
 fn parseArgs(allocator: Allocator) !Config {
@@ -76,6 +89,12 @@ fn parseArgs(allocator: Allocator) !Config {
     defer std.process.argsFree(allocator, args);
 
     var config = Config{};
+
+    // Environment variable overrides
+    if ((std.process.hasEnvVar(allocator, "DZ_TINY") catch false))
+        config.model_size = .tiny;
+    if ((std.process.hasEnvVar(allocator, "DZ_SMALL") catch false))
+        config.model_size = .small;
 
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
@@ -89,6 +108,7 @@ fn parseArgs(allocator: Allocator) !Config {
             i += 1;
         } else if (std.mem.eql(u8, arg, "--model") and i + 1 < args.len) {
             config.model_path = args[i + 1];
+            config.model_size = .full;
             i += 1;
         } else if (std.mem.eql(u8, arg, "--backend") and i + 1 < args.len) {
             const backend_str = args[i + 1];
@@ -98,9 +118,17 @@ fn parseArgs(allocator: Allocator) !Config {
                 std.process.exit(1);
             };
             i += 1;
+        } else if (std.mem.eql(u8, arg, "--tiny")) {
+            config.model_size = .tiny;
+        } else if (std.mem.eql(u8, arg, "--small")) {
+            config.model_size = .small;
+        } else if (std.mem.eql(u8, arg, "--full")) {
+            config.model_size = .full;
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             printHelp();
             std.process.exit(0);
+        } else if (std.mem.eql(u8, arg, "--no-server")) {
+            return config;
         }
     }
 
@@ -124,14 +152,19 @@ fn initBackend(allocator: Allocator, backend_type: Config.Backend) !deepseek_cor
 
 fn printHelp() void {
     print("DeepZig V3 - High-Performance LLM Inference\n\n", .{});
-    print("Usage: deepseek-v3-zig [OPTIONS]\n\n", .{});
+    print("Usage: deepzig-v3 [OPTIONS]\n\n", .{});
     print("Options:\n", .{});
     print("  --port <PORT>        Port to listen on (default: 8080)\n", .{});
     print("  --host <HOST>        Host to bind to (default: 127.0.0.1)\n", .{});
-    print("  --model <PATH>       Path to model weights\n", .{});
+    print("  --model <PATH>       Path to model weights (loads in FULL size)\n", .{});
+    print("  --tiny               Use tiny test model (default)\n", .{});
+    print("  --small              Use small test model\n", .{});
+    print("  --full               Use full DeepZig model\n", .{});
     print("  --backend <BACKEND>  Backend to use: cpu, metal, cuda, webgpu (default: cpu)\n", .{});
-    print("  --help, -h           Show this help message\n\n", .{});
+    print("  --help, -h           Show this help message\n", .{});
+    print("  --no-server          Skip starting the web server\n", .{});
+    print("\n", .{});
     print("Examples:\n", .{});
-    print("  deepseek-v3-zig --port 3000 --backend metal\n", .{});
-    print("  deepseek-v3-zig --model ./models/deepseek-v3.bin --backend cuda\n", .{});
+    print("  deepzig-v3 --port 3000 --backend metal\n", .{});
+    print("  deepzig-v3 --model ./models/deepseek-v3.bin --backend cuda\n", .{});
 }

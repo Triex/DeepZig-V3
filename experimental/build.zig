@@ -16,6 +16,9 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    // Apply release mode optimizations
+    configureOptimizations(exe, optimize);
+
     // BLAS library configuration based on target platform
     configureBlas(exe, target);
 
@@ -80,6 +83,9 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    // Apply optimizations to benchmarks
+    configureOptimizations(benchmark_exe, optimize);
+
     // Add the same modules to benchmark
     benchmark_exe.root_module.addImport("deepseek_core", deepseek_core);
 
@@ -114,6 +120,9 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    // Apply optimizations to BLAS benchmark
+    configureOptimizations(blas_bench_exe, optimize);
+
     blas_bench_exe.root_module.addImport("deepseek_core", deepseek_core);
     configureBlas(blas_bench_exe, target);
 
@@ -128,6 +137,9 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+
+    // Apply optimizations to validation
+    configureOptimizations(validation_exe, optimize);
 
     // Add core modules
     validation_exe.root_module.addImport("deepseek_core", deepseek_core);
@@ -151,6 +163,31 @@ pub fn build(b: *std.Build) void {
 
     const validation_run_step = b.step("validate", "Run comprehensive validation suite");
     validation_run_step.dependOn(&validation_run_cmd.step);
+}
+
+/// Configure optimizations for maximum performance
+fn configureOptimizations(step: *std.Build.Step.Compile, optimize: std.builtin.OptimizeMode) void {
+    switch (optimize) {
+        .ReleaseFast, .ReleaseSmall => {
+            // Maximum performance optimizations
+            step.root_module.addCMacro("NDEBUG", "1");
+            // Disable LTO for now to avoid build issues
+            // step.want_lto = true;
+
+            // Enable advanced vectorization and optimizations
+            step.root_module.addCMacro("ZIG_FAST_MATH", "1");
+            step.root_module.addCMacro("ZIG_RELEASE_MODE", "1");
+        },
+        .ReleaseSafe => {
+            // Balanced optimizations with safety
+            step.root_module.addCMacro("ZIG_RELEASE_SAFE", "1");
+            // step.want_lto = true;
+        },
+        .Debug => {
+            // Debug mode - enable debugging features
+            step.root_module.addCMacro("ZIG_DEBUG_MODE", "1");
+        },
+    }
 }
 
 /// Configure BLAS linking for the given compile step based on target platform

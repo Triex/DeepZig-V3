@@ -11,8 +11,8 @@ pub fn main() !void {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    print("🧮 DeepSeek V3 BLAS Benchmark Suite\n");
-    print("=====================================\n\n");
+    print("🧮 DeepSeek V3 BLAS Benchmark Suite\n", .{});
+    print("=====================================\n\n", .{});
 
     try deepseek_core.blas.benchmarkBlas(allocator);
 }

@@ -8,6 +8,7 @@ const json = std.json;
 const Backend = @import("backend.zig").Backend;
 const CoreError = @import("root.zig").CoreError;
 const FloatTensor = @import("tensor.zig").FloatTensor;
+pub const ModelConfig = @import("config.zig").ModelConfig;
 const Shape = @import("tensor.zig").Shape;
 const Tokenizer = @import("tokenizer.zig").Tokenizer;
 const Transformer = @import("transformer.zig").Transformer;
@@ -21,62 +22,6 @@ pub const ModelError = CoreError || error{
     UnsupportedFormat,
     FileNotFound,
     InvalidConfig,
-};
-
-/// Model configuration matching DeepSeek V3 architecture
-pub const ModelConfig = struct {
-    // Model dimensions
-    vocab_size: u32,
-    hidden_size: u32,
-    intermediate_size: u32,
-    num_hidden_layers: u32,
-    num_attention_heads: u32,
-    num_key_value_heads: u32,
-    max_position_embeddings: u32,
-
-    // MoE configuration
-    num_experts: u32,
-    num_experts_per_token: u32,
-    expert_capacity: u32,
-
-    // Multi-head Latent Attention (MLA) config
-    qk_nope_head_dim: u32,
-    qk_rope_head_dim: u32,
-    v_head_dim: u32,
-    qk_rope_base: f32,
-
-    // Activation function
-    hidden_act: []const u8, // "swiglu" for DeepSeek V3
-
-    // Normalization
-    rms_norm_eps: f32,
-
-    // Quantization settings
-    use_fp16: bool,
-    use_bf16: bool,
-
-    pub fn deepseekV3Default() ModelConfig {
-        return ModelConfig{
-            .vocab_size = 129280,
-            .hidden_size = 7168,
-            .intermediate_size = 18432,
-            .num_hidden_layers = 61,
-            .num_attention_heads = 128,
-            .num_key_value_heads = 128,
-            .max_position_embeddings = 32768,
-            .num_experts = 256,
-            .num_experts_per_token = 8,
-            .expert_capacity = 64,
-            .qk_nope_head_dim = 128,
-            .qk_rope_head_dim = 64,
-            .v_head_dim = 128,
-            .qk_rope_base = 10000.0,
-            .hidden_act = "swiglu",
-            .rms_norm_eps = 1e-6,
-            .use_fp16 = false,
-            .use_bf16 = true,
-        };
-    }
 };
 
 /// Model information
@@ -119,7 +64,7 @@ const SafeTensorsHeader = struct {
     }
 };
 
-/// DeepSeek V3 Model
+/// DeepSeek V3 Model with enhanced configuration support
 pub const Model = struct {
     config: ModelConfig,
     transformer: Transformer,
@@ -137,37 +82,70 @@ pub const Model = struct {
 
     const Self = @This();
 
-    /// Load model from file path (safetensors format)
-    pub fn loadFromPath(allocator: Allocator, path: []const u8, backend: Backend) !Self {
-        std.log.info("🔄 Loading DeepSeek V3 model from: {s}", .{path});
+    /// Load model from directory (HuggingFace format: config.json + model.safetensors)
+    pub fn loadFromDirectory(allocator: Allocator, model_dir: []const u8, backend: Backend) !Self {
+        std.log.info("🏗️ Loading DeepSeek V3 model from directory: {s}", .{model_dir});
+
+        // Load configuration
+        const config_path = try std.fs.path.join(allocator, &[_][]const u8{ model_dir, "config.json" });
+        defer allocator.free(config_path);
+
+        const config = ModelConfig.loadFromFile(allocator, config_path) catch |err| {
+            std.log.warn("⚠️ Could not load config.json: {}. Using tiny test config for development.", .{err});
+            return ModelConfig.tinyTest();
+        };
+
+        // Validate configuration
+        try config.validate();
+        std.log.info("✅ Configuration validated: {}", .{config});
+
+        // Load tokenizer
+        const tokenizer_path = try std.fs.path.join(allocator, &[_][]const u8{ model_dir, "tokenizer.json" });
+        defer allocator.free(tokenizer_path);
+
+        const tokenizer = Tokenizer.loadFromFile(allocator, tokenizer_path) catch |err| {
+            std.log.warn("⚠️ Could not load tokenizer.json: {}. Using basic tokenizer.", .{err});
+            return try Tokenizer.init(allocator, config.vocab_size);
+        };
+
+        // Load model weights
+        const model_path = try std.fs.path.join(allocator, &[_][]const u8{ model_dir, "model.safetensors" });
+        defer allocator.free(model_path);
+
+        return try Self.loadFromSafetensorsWithConfig(allocator, model_path, config, tokenizer, backend);
+    }
+
+    /// Load model from file path (safetensors format) with custom config
+    pub fn loadFromSafetensorsWithConfig(allocator: Allocator, path: []const u8, config: ModelConfig, tokenizer: Tokenizer, backend: Backend) !Self {
+        std.log.info("🔄 Loading model weights from: {s}", .{path});
 
         // Check if path exists and determine file type
         const file = std.fs.cwd().openFile(path, .{}) catch |err| switch (err) {
             error.FileNotFound => {
-                std.log.err("❌ Model file not found: {s}", .{path});
-                return ModelError.FileNotFound;
+                std.log.warn("⚠️ Model file not found: {s}. Creating default model.", .{path});
+                return try Self.loadDefaultWithConfig(allocator, config, tokenizer, backend);
             },
             else => return err,
         };
         defer file.close();
 
-        // Determine file format
-        const extension = std.fs.path.extension(path);
-        if (std.mem.eql(u8, extension, ".safetensors")) {
-            return try loadFromSafetensors(allocator, file, backend);
-        } else {
-            std.log.err("❌ Unsupported model format: {s}. Currently only .safetensors is supported.", .{extension});
-            return ModelError.UnsupportedFormat;
-        }
+        return try loadFromSafetensorsFile(allocator, file, config, tokenizer, backend);
+    }
+
+    /// Load model from file path (safetensors format)
+    pub fn loadFromPath(allocator: Allocator, path: []const u8, backend: Backend) !Self {
+        const default_config = ModelConfig.defaultDeepSeekV3();
+        const tokenizer = try Tokenizer.init(allocator, default_config.vocab_size);
+        return try Self.loadFromSafetensorsWithConfig(allocator, path, default_config, tokenizer, backend);
     }
 
     /// Load model from safetensors file
-    fn loadFromSafetensors(allocator: Allocator, file: std.fs.File, backend: Backend) !Self {
+    fn loadFromSafetensorsFile(allocator: Allocator, file: std.fs.File, config: ModelConfig, tokenizer: Tokenizer, backend: Backend) !Self {
         std.log.info("📦 Loading SafeTensors model...", .{});
 
         // Read file size
         const file_size = try file.getEndPos();
-        std.log.info("  File size: {} bytes", .{file_size});
+        std.log.info("  File size: {} bytes ({d:.1} MB)", .{ file_size, @as(f64, @floatFromInt(file_size)) / (1024.0 * 1024.0) });
 
         // Read the header size (first 8 bytes)
         var header_size_bytes: [8]u8 = undefined;
@@ -202,9 +180,8 @@ pub const Model = struct {
             tensor_count += 1;
         }
 
-        // Determine model configuration from tensors
-        const config = try inferModelConfig(header, allocator);
-        std.log.info("  Inferred config - Hidden size: {}, Layers: {}", .{ config.hidden_size, config.num_hidden_layers });
+        // Verify config matches model architecture
+        try verifyConfigMatchesModel(config, header);
 
         // Read tensor data from file
         const data_start_offset = 8 + header_size;
@@ -215,14 +192,58 @@ pub const Model = struct {
         _ = try file.readAll(tensor_data);
 
         // Load weights into model
-        return try loadModelFromTensorData(allocator, config, header, tensor_data, backend);
+        return try loadModelFromTensorData(allocator, config, header, tensor_data, tokenizer, backend);
+    }
+
+    /// Verify that the config matches the model architecture in safetensors
+    fn verifyConfigMatchesModel(config: ModelConfig, header: SafeTensorsHeader) !void {
+        std.log.debug("🔍 Verifying config matches model architecture...", .{});
+
+        // Check embedding dimensions
+        if (header.tensors.get("model.embed_tokens.weight")) |embed_info| {
+            if (embed_info.shape.len >= 2) {
+                const file_vocab_size = @as(u32, @intCast(embed_info.shape[0]));
+                const file_hidden_size = @as(u32, @intCast(embed_info.shape[1]));
+
+                if (file_vocab_size != config.vocab_size) {
+                    std.log.warn("⚠️ Vocab size mismatch: config={}, model={}", .{ config.vocab_size, file_vocab_size });
+                }
+                if (file_hidden_size != config.hidden_size) {
+                    std.log.err("❌ Hidden size mismatch: config={}, model={}", .{ config.hidden_size, file_hidden_size });
+                    return ModelError.InvalidConfig;
+                }
+            }
+        }
+
+        // Count layers in model
+        var max_layer_idx: u32 = 0;
+        var tensor_iter = header.tensors.iterator();
+        while (tensor_iter.next()) |entry| {
+            const name = entry.key_ptr.*;
+            if (std.mem.startsWith(u8, name, "model.layers.")) {
+                // Extract layer number
+                var parts = std.mem.splitScalar(u8, name, '.');
+                _ = parts.next(); // "model"
+                _ = parts.next(); // "layers"
+                const layer_str = parts.next() orelse continue;
+                const layer_idx = std.fmt.parseInt(u32, layer_str, 10) catch continue;
+                max_layer_idx = @max(max_layer_idx, layer_idx);
+            }
+        }
+        const file_num_layers = max_layer_idx + 1;
+
+        if (file_num_layers != config.num_hidden_layers) {
+            std.log.warn("⚠️ Layer count mismatch: config={}, model={}", .{ config.num_hidden_layers, file_num_layers });
+        }
+
+        std.log.debug("✅ Config verification complete", .{});
     }
 
     /// Parse SafeTensors JSON header
     fn parseSafetensorsHeader(allocator: Allocator, header_json: []const u8) !SafeTensorsHeader {
         std.log.debug("🔍 Parsing SafeTensors header...", .{});
 
-        var parsed = std.json.parseFromSlice(std.json.Value, allocator, header_json, .{}) catch |err| {
+        var parsed = json.parseFromSlice(json.Value, allocator, header_json, .{}) catch |err| {
             std.log.err("❌ Failed to parse header JSON: {}", .{err});
             return ModelError.SafetensorsError;
         };
@@ -281,61 +302,19 @@ pub const Model = struct {
         };
     }
 
-    /// Infer model configuration from tensor shapes
-    fn inferModelConfig(header: SafeTensorsHeader, allocator: Allocator) !ModelConfig {
-        _ = allocator;
-        std.log.debug("🔍 Inferring model configuration from tensor shapes...", .{});
-
-        var config = ModelConfig.deepseekV3Default();
-
-        // Look for embedding layer to determine vocab size and hidden size
-        if (header.tensors.get("model.embed_tokens.weight")) |embed_info| {
-            if (embed_info.shape.len >= 2) {
-                config.vocab_size = @intCast(embed_info.shape[0]);
-                config.hidden_size = @intCast(embed_info.shape[1]);
-            }
-        }
-
-        // Count layers by finding highest layer index
-        var max_layer_idx: u32 = 0;
-        var tensor_iter = header.tensors.iterator();
-        while (tensor_iter.next()) |entry| {
-            const name = entry.key_ptr.*;
-            if (std.mem.startsWith(u8, name, "model.layers.")) {
-                // Extract layer number
-                var parts = std.mem.splitScalar(u8, name, '.');
-                _ = parts.next(); // "model"
-                _ = parts.next(); // "layers"
-                const layer_str = parts.next() orelse continue;
-                const layer_idx = std.fmt.parseInt(u32, layer_str, 10) catch continue;
-                max_layer_idx = @max(max_layer_idx, layer_idx);
-            }
-        }
-        config.num_hidden_layers = max_layer_idx + 1;
-
-        std.log.info("✅ Inferred configuration:", .{});
-        std.log.info("  Vocab size: {}", .{config.vocab_size});
-        std.log.info("  Hidden size: {}", .{config.hidden_size});
-        std.log.info("  Layers: {}", .{config.num_hidden_layers});
-
-        return config;
-    }
-
     /// Load model from parsed tensor data
     fn loadModelFromTensorData(
         allocator: Allocator,
         config: ModelConfig,
         header: SafeTensorsHeader,
         tensor_data: []const u8,
+        tokenizer: Tokenizer,
         backend: Backend,
     ) !Self {
         std.log.info("🏗️ Creating model from tensor data...", .{});
 
-        // Initialize transformer with inferred config
+        // Initialize transformer with config
         const transformer = try Transformer.init(allocator, config, backend);
-
-        // Initialize tokenizer
-        const tokenizer = try Tokenizer.init(allocator, config.vocab_size);
 
         // Load embedding weights
         const embed_tokens = try loadTensorFromSafetensors(
@@ -442,21 +421,12 @@ pub const Model = struct {
         return tensor;
     }
 
-    /// Load default/demo model
-    pub fn loadDefault(allocator: Allocator, backend: Backend) !Self {
-        const config = ModelConfig.deepseekV3Default();
-
-        std.log.info("Creating default DeepSeek V3 model...", .{});
-        std.log.info("  Hidden size: {}", .{config.hidden_size});
-        std.log.info("  Layers: {}", .{config.num_hidden_layers});
-        std.log.info("  Experts: {}", .{config.num_experts});
-        std.log.info("  Vocab size: {}", .{config.vocab_size});
+    /// Load default/demo model with custom config
+    pub fn loadDefaultWithConfig(allocator: Allocator, config: ModelConfig, tokenizer: Tokenizer, backend: Backend) !Self {
+        std.log.info("🎯 Creating default model with config: {}", .{config});
 
         // Initialize transformer
         const transformer = try Transformer.init(allocator, config, backend);
-
-        // Initialize tokenizer
-        const tokenizer = try Tokenizer.init(allocator, config.vocab_size);
 
         // Initialize embedding layers
         var embed_tokens = try FloatTensor.init(allocator, &[_]usize{ config.vocab_size, config.hidden_size });
@@ -485,6 +455,27 @@ pub const Model = struct {
         };
     }
 
+    /// Load default/demo model
+    pub fn loadDefault(allocator: Allocator, backend: Backend) !Self {
+        const config = ModelConfig.defaultDeepSeekV3();
+        const tokenizer = try Tokenizer.init(allocator, config.vocab_size);
+        return try Self.loadDefaultWithConfig(allocator, config, tokenizer, backend);
+    }
+
+    /// Load tiny test model (2 layers, small dims)
+    pub fn loadTiny(allocator: Allocator, backend: Backend) !Self {
+        const config = ModelConfig.tinyTest();
+        const tokenizer = try Tokenizer.init(allocator, config.vocab_size);
+        return try Self.loadDefaultWithConfig(allocator, config, tokenizer, backend);
+    }
+
+    /// Load small test model (4 layers, medium dims)
+    pub fn loadSmall(allocator: Allocator, backend: Backend) !Self {
+        const config = ModelConfig.smallTest();
+        const tokenizer = try Tokenizer.init(allocator, config.vocab_size);
+        return try Self.loadDefaultWithConfig(allocator, config, tokenizer, backend);
+    }
+
     /// Free model memory
     pub fn deinit(self: *Self) void {
         self.transformer.deinit();
@@ -493,6 +484,91 @@ pub const Model = struct {
         if (self.embed_positions) |*pos| pos.deinit();
         self.lm_head.deinit();
         self.norm.deinit();
+    }
+
+    /// Simple text generation function for testing
+    pub fn generateText(self: *Self, prompt: []const u8, max_tokens: u32) ![]const u8 {
+        _ = max_tokens; // TODO: Use for generation loop
+        std.log.info("🤖 Generating response for: '{s}'", .{prompt});
+        
+        // Tokenize input
+        const input_tokens = try self.tokenizer.encode(prompt);
+        defer self.allocator.free(input_tokens);
+        
+        std.log.info("📝 Input tokens: {} -> {any}", .{ input_tokens.len, input_tokens[0..@min(10, input_tokens.len)] });
+        
+        // Determine sequence length
+        const seq_len = input_tokens.len;
+        
+        // Embedding lookup: input_ids -> hidden_states
+        var hidden_states = try FloatTensor.init(self.allocator, &[_]usize{ 1, seq_len, self.config.hidden_size });
+        defer hidden_states.deinit();
+        
+        // Simple embedding lookup (normally this would be proper embedding layer)
+        for (0..seq_len) |s| {
+            const token_id = input_tokens[s];
+            const embed_idx = @min(token_id, self.config.vocab_size - 1);
+            
+            for (0..self.config.hidden_size) |h| {
+                const embed_offset = embed_idx * self.config.hidden_size + h;
+                const hidden_offset = s * self.config.hidden_size + h;
+                hidden_states.data[hidden_offset] = self.embed_tokens.data[embed_offset];
+            }
+        }
+        
+        std.log.info("📊 Hidden states shape: {}x{}x{}", .{ 1, seq_len, self.config.hidden_size });
+        
+        // Forward pass through transformer
+        var output_hidden = try FloatTensor.init(self.allocator, &[_]usize{ 1, seq_len, self.config.hidden_size });
+        defer output_hidden.deinit();
+        
+        try self.transformer.forward(&hidden_states, null, null, null, false, &output_hidden);
+        
+        // Skip final norm for now (placeholder)
+        const normed_output_ptr = &output_hidden;
+        
+        // Project to vocabulary: [batch, seq_len, hidden] -> [seq_len, vocab]
+        var logits = try FloatTensor.init(self.allocator, &[_]usize{ seq_len, self.config.vocab_size });
+        defer logits.deinit();
+        
+        // Simple matrix multiplication: normed_output @ lm_head -> logits
+        // This is a simplified version - in practice you'd use BLAS
+        for (0..seq_len) |s| {
+            for (0..self.config.vocab_size) |v| {
+                var sum: f32 = 0.0;
+                for (0..self.config.hidden_size) |h| {
+                    const hidden_val = normed_output_ptr.data[s * self.config.hidden_size + h];
+                    const weight_val = self.lm_head.data[h * self.config.vocab_size + v];
+                    sum += hidden_val * weight_val;
+                }
+                logits.data[s * self.config.vocab_size + v] = sum;
+            }
+        }
+        
+        // Get next token (greedy sampling from last position)
+        const last_pos_offset = (seq_len - 1) * self.config.vocab_size;
+        var max_logit: f32 = logits.data[last_pos_offset];
+        var next_token: u32 = 0;
+        
+        for (1..self.config.vocab_size) |v| {
+            const logit = logits.data[last_pos_offset + v];
+            if (logit > max_logit) {
+                max_logit = logit;
+                next_token = @intCast(v);
+            }
+        }
+        
+        std.log.info("🎯 Next token: {} (logit: {d:.3})", .{ next_token, max_logit });
+        
+        // Decode next token
+        const output_tokens = try self.allocator.alloc(u32, 1);
+        defer self.allocator.free(output_tokens);
+        output_tokens[0] = next_token;
+        
+        const generated_text = try self.tokenizer.decode(output_tokens);
+        
+        std.log.info("✅ Generated: '{s}'", .{generated_text});
+        return generated_text;
     }
 
     /// Get model information
@@ -522,7 +598,7 @@ pub const Model = struct {
         // 3. Sample next token from logits
         // 4. Repeat until max_tokens or EOS
 
-        std.log.debug("Generation not yet implemented");
+        std.log.debug("Generation not yet implemented", .{});
         return error.NotImplemented;
     }
 
@@ -542,7 +618,7 @@ pub const Model = struct {
         _ = input_ids;
         _ = output;
 
-        std.log.debug("Model forward pass (placeholder)");
+        std.log.debug("Model forward pass (placeholder)", .{});
     }
 
     /// Estimate model parameters
@@ -569,7 +645,8 @@ pub const Model = struct {
     /// Estimate memory usage in bytes
     fn estimateMemoryUsage(self: *const Self) u64 {
         const params = self.estimateParameters();
-        const dtype_size: u64 = if (self.config.use_fp16 or self.config.use_bf16) 2 else 4;
+        const dtype_size: u64 = if (std.mem.eql(u8, self.config.torch_dtype, "float16") or
+            std.mem.eql(u8, self.config.torch_dtype, "bfloat16")) 2 else 4;
 
         // Model weights + activation memory + KV cache
         return params * dtype_size * 2; // Rough estimate
@@ -621,7 +698,7 @@ test "model creation" {
 }
 
 test "model config" {
-    const config = ModelConfig.deepseekV3Default();
+    const config = ModelConfig.defaultDeepSeekV3();
     std.testing.expect(config.vocab_size == 129280) catch unreachable;
     std.testing.expect(config.num_experts == 256) catch unreachable;
     std.testing.expect(config.num_experts_per_token == 8) catch unreachable;
