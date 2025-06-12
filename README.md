@@ -30,7 +30,7 @@ A **DRAFT implementation** of DeepSeek V3 in Zig to create a high-performance, w
 - ✅ **Drafted BPE Tokenizer** - Supports HuggingFace tokenizer.json format with encoding/decoding
 - ✅ **Generative Pipeline** - Draft inference framework with greedy/sampling support
 - ✅ **Model Validation Framework** - Real weight loading with safetensors format verification
-- ✅ **Complete Transformer Architecture** with RMS normalization, SwiGLU, MoE integration
+- ✅ **Base Transformer Architecture** with RMS normalization, SwiGLU, MoE integration
 - ✅ **Draft Validation Framework** - Multi-dimensional testing (7/8 tests passing, 84.4% confidence)
 - ✅ **RoPE (Rotary Position Encoding)** with pre-computed embeddings
 - ✅ **KV Cache** for efficient autoregressive inference  
@@ -42,11 +42,11 @@ A **DRAFT implementation** of DeepSeek V3 in Zig to create a high-performance, w
 - ✅ Build system draft
 - ✅ **BLAS integration working** (Apple Accelerate backend functional)
 - ✅ **Improved matrix operations** (1000+ GFLOPS performance on an M1 Macbook)
-- ⚠️ **DRAFT IMPLEMENTATION** - Ready for real model loading and production deployment
+- ⚠️ **DRAFT IMPLEMENTATION** - Theoretically solid foundation ready for real model loading and production deployment testing
 
-**Performance Update**: ~~Current naive algorithms are ~1000x slower than optimized BLAS~~ **MLA attention architecture with BLAS integration now complete.** Matrix multiplication: **2.1ms for 1024×1024** at **1143 GFLOPS**, with peak **1143 GFLOPS at 512×512** on an M1 MacBook Pro under heavy load. This represents a ~**3000x speedup** over our initial naive implementation. See [experimental benchmarks](experimental/README.md#performance-notes) for detailed performance data.
+**Performance Update**: ~~Current naive algorithms are ~1000x slower than optimized BLAS~~ **MLA attention architecture with BLAS integration now drafted.** Matrix multiplication: **2.1ms for 1024×1024** at **1143 GFLOPS**, with peak **1143 GFLOPS at 512×512** on an M1 MacBook Pro under heavy load. This represents a ~**3000x speedup** over our initial naive implementation. See [experimental benchmarks](experimental/README.md#performance-notes) for detailed performance data.
 
-**⚠️ Important**: This is a **draft implementation** following DeepSeek V3 paper specifications with foundational components. Architecture is complete with drafted HuggingFace compatibility, drafted theoretically solid tokenization, and drafted model validation framework. Draft validation shows strong foundation (7/8 tests passing, 84.4% confidence) with optimization opportunities identified.
+**⚠️ Important**: This is a **draft implementation** following DeepSeek V3 paper specifications with foundational components. Architecture is drafted with drafted HuggingFace compatibility, drafted theoretically solid tokenization, and drafted model validation framework. Draft validation shows strong foundation (7/8 tests passing, 84.4% confidence) with optimization opportunities identified.
 
 ## Why This Matters
 
@@ -56,7 +56,7 @@ Current LLM inference is dominated by Python/PyTorch, which introduces:
 - **Complex deployment** with heavy runtimes
 - **Platform lock-in** due to dependency complexity
 
-**Progress Update**: Our implementation now includes **complete Multi-Head Latent Attention architecture** with optimized BLAS acceleration - the first architectural implementation of this DeepSeek V3 innovation.
+**Progress Update**: Our implementation now includes **drafted Multi-Head Latent Attention architecture** with optimized BLAS acceleration - the first architectural implementation of this DeepSeek V3 innovation.
 
 ## Expected Benefits vs Current Reality
 
@@ -68,7 +68,7 @@ Current LLM inference is dominated by Python/PyTorch, which introduces:
 | Deployment | Complex | **Copy & run** | ✅ **Copy & run** |
 | Matrix Mul (1024×1024) | ~1ms (optimized) | **< 1ms** | ✅ **2.1ms (1164 GFLOPS)** |
 | Peak Performance | ~1500 GFLOPS | **> 1000 GFLOPS** | ✅ **1164 GFLOPS** |
-| **MLA Attention** | ❌ Not available | **✅ Implemented** | ✅ **Architecture Complete** |
+| **MLA Attention** | ❌ Not available | **✅ Implemented** | ✅ **Architecture Drafted** |
 | **Validation Quality** | Basic testing | **Draft validation** | ✅ **7/8 tests pass, 84.4% confidence** |
 
 *Benchmarked on Apple M1 MacBook Pro under very heavy load*
@@ -129,7 +129,7 @@ Current LLM inference is dominated by Python/PyTorch, which introduces:
 
 ### Phase 2: Core Model ✅ **ARCHITECTURALLY COMPLETE** 
 - [x] **Multi-Head Latent Attention (MLA)** - Core innovation architecturally implemented
-- [x] **Complete transformer layers** with RMS norm, SwiGLU, residual connections
+- [x] **Drafted transformer layers** with RMS norm, SwiGLU, residual connections
 - [x] **RoPE (Rotary Position Encoding)** with efficient pre-computed embeddings
 - [x] **KV Cache** for autoregressive inference optimization
 - [x] **MoE integration architecture** (expert routing stub implemented)
@@ -166,7 +166,7 @@ Current LLM inference is dominated by Python/PyTorch, which introduces:
 ## Technical Achievements
 
 ### ✅ Multi-Head Latent Attention (MLA)
-**The key innovation of DeepSeek V3 - now architecturally complete:**
+**The key innovation of DeepSeek V3 - now architecturally complete (drafted):**
 
 - **Latent space projections**: Efficient key-value computation through lower-dimensional latent space
 - **RoPE integration**: Proper positional encoding with pre-computed embeddings
@@ -177,7 +177,7 @@ Current LLM inference is dominated by Python/PyTorch, which introduces:
 
 **⚠️ Validation Required**: Architecture follows paper specifications but needs validation with real DeepSeek V3 weights.
 
-### ✅ Complete Transformer Architecture
+### ✅ Complete Transformer Architecture (drafted)
 - **RMS Layer Normalization**: Following DeepSeek V3 specifications
 - **SwiGLU Activation**: Gate/Up/Down projections with SiLU activation function
 - **Residual connections**: Proper gradient flow through transformer layers
@@ -257,7 +257,7 @@ This **DRAFT PROJECT** would benefit from expertise in:
 
 ## Current Status & Next Steps
 
-**🧠 What's Working**: ✅ **Complete MLA attention architecture + draft validation**, BLAS acceleration, transformer layers, validation framework showing 7/8 tests passing  
+**🧠 What's Working**: ✅ **DRAFT MLA attention architecture + draft validation**, BLAS acceleration, transformer layers, validation framework showing 7/8 tests passing  
 **⚠️ What's Missing**: Performance optimization (2 tok/s → 100+ tok/s), memory efficiency (40% → 50%+), real weight loading, tokenization, generation loop  
 **📊 Performance Status**: ✅ **MLA architecture with 1000+ GFLOPS** + **84.4% validation confidence** with clear optimization roadmap  
 **🎯 Next Priority**: **Performance optimization phase** - address throughput and memory efficiency issues identified by validation

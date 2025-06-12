@@ -23,7 +23,7 @@ A high-performance implementation of DeepSeek V3 in [Zig](https://ziglang.org/) 
 > 
 > **Latest Achievement**: Draft production-ready components with HuggingFace compatibility, BPE tokenization, and model validation framework<br/>Multi-Head Latent Attention mechanism architecturally complete with RoPE, KV caching, and BLAS acceleration<br/>
 > **Performance Status**: 1160+ GFLOPS with Apple Accelerate backend working (measured on Apple M1 Macbook)<br/>
-> **Implementation Status**: ⚡ **Enhanced practical implementation - ready for real model loading and validation**<br/>
+> **Implementation Status**: ⚡ **Enhanced practical implementation to theoretically solid foundation - ready for real model loading and validation testing**<br/>
 > 
 > See [Performance Results](#performance-notes) for detailed benchmarks.
 
@@ -201,7 +201,7 @@ pub const MLAConfig = struct {
 - [x] **Generation Pipeline** - Framework for text generation with sampling
 - [x] **Model Validation Framework** - Real weight loading and verification
 - [x] **Multi-Head Latent Attention (MLA)** - Core DeepSeek V3 innovation
-- [x] **Complete Transformer Architecture** with RMS norm, SwiGLU, residual connections
+- [x] **Drafted Transformer Architecture** with RMS norm, SwiGLU, residual connections
 - [x] **RoPE (Rotary Position Encoding)** with pre-computed embeddings
 - [x] **KV Cache** for efficient autoregressive inference
 - [x] **BLAS Integration** for all matrix operations
