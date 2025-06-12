@@ -48,7 +48,7 @@ class DeepZigMediumLM(PreTrainedModel):
     def __init__(self, cfg):
         super().__init__(cfg)
         self.embed = nn.Embedding(cfg.vocab_size, cfg.hidden_size)
-        
+
         # Create transformer layers with attention and MLP blocks
         self.layers = nn.ModuleList([])
         for i in range(cfg.num_hidden_layers):
@@ -62,13 +62,13 @@ class DeepZigMediumLM(PreTrainedModel):
                     'o_proj': nn.Linear(cfg.num_attention_heads * cfg.v_head_dim, cfg.hidden_size),
                     'norm': nn.LayerNorm(cfg.hidden_size, eps=cfg.rms_norm_eps),
                 }),
-                
+
                 # MLP block (with MoE for some layers)
                 'mlp': nn.ModuleDict({
                     'norm': nn.LayerNorm(cfg.hidden_size, eps=cfg.rms_norm_eps),
                 })
             })
-            
+
             # Add MLP components based on whether this is an MoE layer
             if i >= cfg.first_k_dense_replace and i % cfg.moe_layer_freq == 0:
                 # MoE layer
@@ -83,21 +83,21 @@ class DeepZigMediumLM(PreTrainedModel):
                 # Standard MLP
                 layer['mlp']['gate_proj'] = nn.Linear(cfg.hidden_size, cfg.intermediate_size)
                 layer['mlp']['down_proj'] = nn.Linear(cfg.intermediate_size, cfg.hidden_size)
-            
+
             self.layers.append(layer)
-        
+
         # Final layer norm
         self.norm = nn.LayerNorm(cfg.hidden_size, eps=cfg.rms_norm_eps)
-        
+
         # LM head
         self.lm_head = nn.Linear(cfg.hidden_size, cfg.vocab_size, bias=False)
-        
+
         # Initialize weights
         self.apply(self._init_weights)
-        
+
         # Tie weights
         self.lm_head.weight = self.embed.weight
-    
+
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
@@ -109,70 +109,70 @@ class DeepZigMediumLM(PreTrainedModel):
             torch.nn.init.ones_(module.weight)
             if module.bias is not None:
                 torch.nn.init.zeros_(module.bias)
-    
+
     def forward(self, input_ids, labels=None, attention_mask=None, **kwargs):
         # Get embeddings
         hidden_states = self.embed(input_ids)
         batch_size, seq_length = input_ids.shape
-        
+
         # Create causal mask for self-attention
         causal_mask = torch.triu(torch.ones((seq_length, seq_length), dtype=torch.bool, device=input_ids.device), diagonal=1)
         causal_mask = causal_mask.unsqueeze(0).unsqueeze(0)  # [1, 1, seq_length, seq_length]
-        
+
         # Process through transformer layers
         for layer in self.layers:
             # Self-attention block with residual connection
             residual = hidden_states
             hidden_states = layer['attention']['norm'](hidden_states)
-            
+
             # Compute QKV projections
             q = layer['attention']['q_proj'](hidden_states)
             k = layer['attention']['k_proj'](hidden_states)
             v = layer['attention']['v_proj'](hidden_states)
-            
+
             # Reshape for attention computation
             head_dim_q = self.config.qk_rope_head_dim
             head_dim_v = self.config.v_head_dim
             num_heads = self.config.num_attention_heads
             num_kv_heads = self.config.num_key_value_heads
-            
+
             q = q.view(batch_size, seq_length, num_heads, head_dim_q).transpose(1, 2)  # [batch, heads, seq, head_dim]
             k = k.view(batch_size, seq_length, num_kv_heads, head_dim_q).transpose(1, 2)  # [batch, heads, seq, head_dim]
             v = v.view(batch_size, seq_length, num_kv_heads, head_dim_v).transpose(1, 2)  # [batch, heads, seq, head_dim]
-            
+
             # Compute attention scores and mask
             attn_weights = torch.matmul(q, k.transpose(-2, -1)) / (head_dim_q ** 0.5)
             attn_weights = attn_weights.masked_fill(causal_mask, float('-inf'))
-            
+
             # Apply attention mask if provided
             if attention_mask is not None:
                 # Expand attention_mask to match attn_weights dimensions
                 expanded_mask = attention_mask.unsqueeze(1).unsqueeze(2)  # [batch, 1, 1, seq]
                 expanded_mask = (1.0 - expanded_mask) * -10000.0  # Convert 0s to large negative values
                 attn_weights = attn_weights + expanded_mask
-            
+
             # Compute attention probabilities and weighted sum
             attn_weights = F.softmax(attn_weights, dim=-1)
             attn_output = torch.matmul(attn_weights, v)  # [batch, heads, seq, head_dim]
-            
+
             # Reshape and project back
             attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_length, -1)
             hidden_states = residual + layer['attention']['o_proj'](attn_output)
-            
+
             # MLP block with residual connection
             residual = hidden_states
             hidden_states = layer['mlp']['norm'](hidden_states)
-            
+
             # Process through MLP (either standard or MoE)
             if 'experts' in layer['mlp']:
                 # MoE layer
                 router_logits = layer['mlp']['router'](hidden_states)  # [batch, seq, num_experts]
                 routing_weights = F.softmax(router_logits, dim=-1)
-                
+
                 # Get top-2 experts
                 top_k = min(2, len(layer['mlp']['experts']))  # Use top-2 experts
                 _, indices = torch.topk(routing_weights, top_k, dim=-1)  # [batch, seq, top_k]
-                
+
                 # Process through selected experts
                 expert_outputs = torch.zeros_like(hidden_states)
                 for b in range(batch_size):
@@ -181,36 +181,36 @@ class DeepZigMediumLM(PreTrainedModel):
                             expert_idx = indices[b, s, k].item()
                             expert = layer['mlp']['experts'][expert_idx]
                             weight = routing_weights[b, s, expert_idx]
-                            
+
                             # Apply expert
                             expert_input = hidden_states[b, s].unsqueeze(0)  # [1, hidden]
                             gate_output = F.gelu(expert['gate_proj'](expert_input))
                             expert_output = expert['down_proj'](gate_output)
                             expert_outputs[b, s] += weight * expert_output.squeeze(0)
-                
+
                 hidden_states = residual + expert_outputs
             else:
                 # Standard MLP
                 gate_output = F.gelu(layer['mlp']['gate_proj'](hidden_states))
                 mlp_output = layer['mlp']['down_proj'](gate_output)
                 hidden_states = residual + mlp_output
-        
+
         # Apply final layer norm
         hidden_states = self.norm(hidden_states)
-        
+
         # Get logits
         logits = self.lm_head(hidden_states)
-        
+
         loss = None
         if labels is not None:
             # Shift so that tokens < n predict n
             shift_logits = logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
-            
+
             # Flatten the tokens
             loss_fct = nn.CrossEntropyLoss(ignore_index=-100)
             loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
-        
+
         return CausalLMOutput(
             loss=loss,
             logits=logits,
@@ -223,8 +223,8 @@ model = DeepZigMediumLM(config)
 print("Loading dataset...")
 ds_full = load_dataset("wikitext", "wikitext-2-raw-v1", split="train")
 
-# Use a smaller subset of the dataset for faster training
-ds = ds_full.select(range(min(1000, len(ds_full))))
+# Use a larger subset of the dataset for better training
+ds = ds_full.select(range(min(10000, len(ds_full))))
 print(f"Using {len(ds)} samples from {len(ds_full)} total")
 
 # Filter out very short texts
@@ -236,27 +236,27 @@ print("Creating and training tokenizer...")
 def create_tokenizer():
     # Create a basic BPE tokenizer
     tokenizer = Tokenizer(models.BPE())
-    
+
     # Add pre-tokenization (split on whitespace and punctuation)
     tokenizer.pre_tokenizer = pre_tokenizers.Sequence([
         pre_tokenizers.WhitespaceSplit(),
         pre_tokenizers.Punctuation()
     ])
-    
+
     # Train on a sample of text
     trainer = trainers.BpeTrainer(
         vocab_size=cfg_dict["vocab_size"],
         special_tokens=["<unk>", "<s>", "</s>", "<pad>", "<mask>"]
     )
-    
-    # Use a sample of the dataset for tokenizer training
+
+    # Use a larger sample of the dataset for tokenizer training
     files = ["tokenizer_training_data.txt"]
     with open(files[0], "w") as f:
-        for i in range(min(5000, len(ds_full))):
+        for i in range(min(20000, len(ds_full))):
             f.write(ds_full[i]["text"] + "\n")
-    
+
     tokenizer.train(files, trainer)
-    
+
     # Add post-processing
     tokenizer.post_processor = processors.TemplateProcessing(
         single="<s> $A </s>",
@@ -266,7 +266,7 @@ def create_tokenizer():
             ("</s>", 2),
         ],
     )
-    
+
     return tokenizer
 
 # Create tokenizer
@@ -278,41 +278,41 @@ print("✅ Saved tokenizer to", f"{out_dir}/tokenizer.json")
 
 # Now tokenize the dataset with our trained tokenizer
 def tokenize_function(examples):
-    max_length = 128
+    max_length = 256  # Increased sequence length for better context
     results = {"input_ids": [], "labels": [], "attention_mask": []}
-    
+
     for text in examples["text"]:
         # Skip empty texts
         if not text.strip():
             continue
-            
+
         # Tokenize the text
         encoded = tokenizer.encode(text)
         tokens = encoded.ids
-        
+
         # Create attention mask (1 for real tokens)
         attention_mask = [1] * len(tokens)
-        
+
         # Truncate if too long
         if len(tokens) > max_length:
             tokens = tokens[:max_length]
             attention_mask = attention_mask[:max_length]
-        
+
         # Pad if too short
         if len(tokens) < max_length:
             padding_length = max_length - len(tokens)
             tokens = tokens + [0] * padding_length
             attention_mask = attention_mask + [0] * padding_length
-        
+
         # Make sure all sequences are exactly max_length
         assert len(tokens) == max_length, f"Token length {len(tokens)} != {max_length}"
         assert len(attention_mask) == max_length, f"Mask length {len(attention_mask)} != {max_length}"
-        
+
         # Store the tokenized text
         results["input_ids"].append(tokens)
         results["labels"].append(tokens.copy())
         results["attention_mask"].append(attention_mask)
-    
+
     return results
 
 print("Tokenizing dataset...")
@@ -332,27 +332,27 @@ class CustomDataCollator:
     def __call__(self, features: List[Dict[str, Union[List[int], torch.Tensor]]]) -> Dict[str, torch.Tensor]:
         # First, pad all sequences to the same length
         max_length = 128
-        
+
         # Initialize batch tensors
         batch = {}
         batch["input_ids"] = torch.zeros((len(features), max_length), dtype=torch.long)
         batch["labels"] = torch.zeros((len(features), max_length), dtype=torch.long)
         batch["attention_mask"] = torch.zeros((len(features), max_length), dtype=torch.long)
-        
+
         # Fill batch tensors
         for i, feature in enumerate(features):
             input_ids = feature["input_ids"]
             labels = feature["labels"]
             attention_mask = feature.get("attention_mask", [1] * len(input_ids))
-            
+
             # Ensure all are the same length by padding
             seq_length = min(len(input_ids), max_length)
-            
+
             # Copy data to batch tensors
             batch["input_ids"][i, :seq_length] = torch.tensor(input_ids[:seq_length])
             batch["labels"][i, :seq_length] = torch.tensor(labels[:seq_length])
             batch["attention_mask"][i, :seq_length] = torch.tensor(attention_mask[:seq_length])
-        
+
         return batch
 
 args = TrainingArguments(
@@ -402,8 +402,8 @@ trainer = Trainer(
 )
 trainer.train()
 
-# Save with safe_serialization=False to handle weight sharing
-trainer.save_model(output_dir="deepzig-medium-demo", safe_serialization=False)
+# Save the model
+trainer.save_model(output_dir="deepzig-medium-demo")
 print("✅ Model training complete")
 
 # 6. Save model weights in Zig-compatible safetensors format
@@ -428,7 +428,7 @@ for name, param in model.named_parameters():
         # Handle transformer layers
         parts = name.split(".")
         layer_num = parts[1]
-        
+
         if "attention" in name:
             # Handle attention components
             if "q_proj" in name:
@@ -479,77 +479,77 @@ def generate_text(prompt, max_length=100, temperature=0.8, top_k=40, top_p=0.9, 
         # Tokenize the prompt with proper BOS token
         if not prompt.startswith("<s>"):
             prompt = "<s> " + prompt
-        
+
         encoded = tokenizer.encode(prompt)
         input_ids = torch.tensor([encoded.ids], device="cpu")
         prompt_length = len(encoded.ids)
-        
+
         # Track generated tokens for repetition penalty
         generated_tokens = set(input_ids[0].tolist())
-        
+
         # Generate text
         with torch.no_grad():
             for _ in range(max_length):
                 # Get model output for current sequence
                 outputs = model(input_ids)
                 next_token_logits = outputs.logits[:, -1, :]
-                
+
                 # Apply repetition penalty to discourage repeating tokens
                 for token_id in generated_tokens:
                     next_token_logits[0, token_id] /= repetition_penalty
-                
+
                 # Apply temperature scaling
                 next_token_logits = next_token_logits / temperature
-                
+
                 # Apply top-k filtering
                 if top_k > 0:
                     top_k_logits, top_k_indices = torch.topk(next_token_logits, top_k)
                     next_token_logits = torch.full_like(next_token_logits, float('-inf'))
                     next_token_logits.scatter_(1, top_k_indices, top_k_logits)
-                
+
                 # Apply top-p (nucleus) filtering
                 if top_p < 1.0:
                     sorted_logits, sorted_indices = torch.sort(next_token_logits, descending=True)
                     cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
-                    
+
                     # Remove tokens with cumulative probability above the threshold
                     sorted_indices_to_remove = cumulative_probs > top_p
                     # Shift the indices to the right to keep also the first token above the threshold
                     sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
                     sorted_indices_to_remove[..., 0] = 0
-                    
+
                     indices_to_remove = sorted_indices[sorted_indices_to_remove]
                     next_token_logits[0, indices_to_remove] = float('-inf')
-                
+
                 # Sample from the filtered distribution
                 probs = F.softmax(next_token_logits, dim=-1)
                 next_token = torch.multinomial(probs, num_samples=1).squeeze(1)
-                
+
                 # Add the new token to the sequence
                 input_ids = torch.cat([input_ids, next_token.unsqueeze(0)], dim=1)
                 generated_tokens.add(next_token.item())
-                
+
                 # Stop if we predict EOS, </s>, or after generating several newlines
-                if (next_token.item() == tokenizer.token_to_id("</s>") or 
-                    next_token.item() == tokenizer.token_to_id("\n") or 
+                if (next_token.item() == tokenizer.token_to_id("</s>") or
+                    next_token.item() == tokenizer.token_to_id("\n") or
                     next_token.item() == tokenizer.token_to_id("<eos>") or
-                    (len(input_ids[0]) > prompt_length + 10 and 
+                    (len(input_ids[0]) > prompt_length + 10 and
                      input_ids[0][-3:].tolist().count(tokenizer.token_to_id("\n")) >= 2)):
                     break
-        
+
         # Decode the generated text
         generated_ids = input_ids[0].tolist()
-        
+
         # Get just the generated part (not the prompt)
         generated_part = generated_ids[prompt_length:]
-        
+
         # Clean up the text
         full_text = tokenizer.decode(generated_ids)
         generated_text = tokenizer.decode(generated_part)
-        
+
         # Clean up special tokens
         generated_text = generated_text.replace("<s>", "").replace("</s>", "").replace("<pad>", "")
-        
+
         return f"{prompt.replace('<s> ', '')}{generated_text}"
     except Exception as e:
         print(f"Error during generation: {e}")
@@ -557,8 +557,8 @@ def generate_text(prompt, max_length=100, temperature=0.8, top_k=40, top_p=0.9, 
 
 # Test with a variety of prompts using different generation parameters
 test_prompts = [
-    "The quick brown fox jumps over", 
-    "In the beginning there was", 
+    "The quick brown fox jumps over",
+    "In the beginning there was",
     "Once upon a time in a land far away",
     "Zig is a programming language designed for",
     "The history of artificial intelligence begins with",
@@ -577,7 +577,7 @@ for prompt in test_prompts[:3]:  # Try a subset with different parameters
     print(f"\nPrompt: {prompt}")
     generated = generate_text(prompt, max_length=150, temperature=1.0, top_k=100, top_p=0.95, repetition_penalty=1.3)
     print(f"Generated: {generated}")
-    
+
 print("\nGenerating with focused parameters (temperature=0.5, top_k=20, top_p=0.85, repetition_penalty=1.5):")
 for prompt in test_prompts[3:5]:  # Try technical prompts with more focused parameters
     print(f"\nPrompt: {prompt}")
