@@ -90,10 +90,10 @@ pub const Model = struct {
         const config_path = try std.fs.path.join(allocator, &[_][]const u8{ model_dir, "config.json" });
         defer allocator.free(config_path);
 
-        const config = ModelConfig.loadFromFile(allocator, config_path) catch |err| {
+        const config = (ModelConfig.loadFromFile(allocator, config_path) catch |err| blk: {
             std.log.warn("⚠️ Could not load config.json: {}. Using tiny test config for development.", .{err});
-            return ModelConfig.tinyTest();
-        };
+            break :blk ModelConfig.tinyTest();
+        });
 
         // Validate configuration
         try config.validate();
@@ -103,10 +103,10 @@ pub const Model = struct {
         const tokenizer_path = try std.fs.path.join(allocator, &[_][]const u8{ model_dir, "tokenizer.json" });
         defer allocator.free(tokenizer_path);
 
-        const tokenizer = Tokenizer.loadFromFile(allocator, tokenizer_path) catch |err| {
+        const tokenizer = (Tokenizer.loadFromFile(allocator, tokenizer_path) catch |err| blk: {
             std.log.warn("⚠️ Could not load tokenizer.json: {}. Using basic tokenizer.", .{err});
-            return try Tokenizer.init(allocator, config.vocab_size);
-        };
+            break :blk try Tokenizer.init(allocator, config.vocab_size);
+        });
 
         // Load model weights
         const model_path = try std.fs.path.join(allocator, &[_][]const u8{ model_dir, "model.safetensors" });

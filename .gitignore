@@ -174,3 +174,7 @@ cython_debug/
 # Zig
 experimental/.zig-cache/
 zig-out/
+
+# Models
+*.safetensors
+optimizer.pt
