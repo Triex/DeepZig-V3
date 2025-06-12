@@ -4,7 +4,7 @@ A high-performance implementation of DeepSeek V3 in [Zig](https://ziglang.org/) 
 
 > **✅ Status: Enhanced Implementation with Real-World Features** 
 > 
-> This project has evolved from a theoretical foundation to a **practical implementation** with production-ready components:
+> This project provides a **theoretical foundation** of DeepZig V3 with significant architectural progress & theoretically production-ready components:
 > - ✅ **Multi-Head Latent Attention (MLA)** - Core DeepSeek V3 innovation architecturally implemented
 > - ✅ **Base Configuration System** - HuggingFace config.json loading with comprehensive draft validation
 > - ✅ **Drafted BPE Tokenizer** - Supports HuggingFace tokenizer.json format with proper encoding/decoding
