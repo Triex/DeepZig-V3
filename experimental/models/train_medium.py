@@ -384,6 +384,29 @@ class DeepZigConversationalModel(PreTrainedModel):
         """Tie the weights between the input embeddings and the output embeddings."""
         self.lm_head.weight = self.embed_tokens.weight
 
+    def prepare_inputs_for_generation(
+        self,
+        input_ids,
+        past_key_values=None,
+        attention_mask=None,
+        inputs_embeds=None,
+        **kwargs
+    ):
+        """Prepare inputs for generation (required by PEFT/LoRA)."""
+        if past_key_values is not None:
+            input_ids = input_ids[:, -1:]
+
+        # If attention_mask is provided, adjust it
+        if attention_mask is not None and past_key_values is not None:
+            attention_mask = attention_mask[:, -(input_ids.shape[-1] + past_key_values[0][0].shape[-2]):]
+
+        return {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "past_key_values": past_key_values,
+            "use_cache": kwargs.get("use_cache", True),
+        }
+
     def _set_gradient_checkpointing(self, module, value=False):
         """Enable or disable gradient checkpointing for the model."""
         if isinstance(module, DeepZigConversationalModel):
