@@ -21,7 +21,7 @@ A high-performance implementation of DeepSeek V3 in [Zig](https://ziglang.org/) 
 > - ✅ **KV Cache** for efficient inference
 > - ✅ **RMS Layer Normalization** following DeepSeek V3 specifications
 > 
-> **Latest Achievement**: Draft production-ready components with HuggingFace compatibility, professional tokenization, and model validation framework<br/>
+> **Latest Achievement**: Draft production-ready components with HuggingFace compatibility, BPE tokenization, and model validation framework<br/>Multi-Head Latent Attention mechanism architecturally complete with RoPE, KV caching, and BLAS acceleration<br/>
 > **Performance Status**: 1160+ GFLOPS with Apple Accelerate backend working (measured on Apple M1 Macbook)<br/>
 > **Implementation Status**: ⚡ **Enhanced practical implementation - ready for real model loading and validation**<br/>
 > 
@@ -37,7 +37,7 @@ This implementation leverages Zig's unique advantages for systems programming to
 - **Single binary deployment** with no runtime dependencies
 - **Cross-platform compilation** for multiple architectures
 - **🆕 HuggingFace Compatibility** - Load models directly from HuggingFace format
-- **🆕 Theoretically Professional Tokenization** - Full BPE implementation with special token support
+- **🆕 Theoretically Solid Tokenization** - Full BPE implementation with special token support
 - **🆕 Base Configuration** - Comprehensive model configuration draft with validation
 
 **🚀 BLAS Acceleration Achieved!** We've successfully integrated Apple Accelerate backend delivering **1000+ GFLOPS** performance - a **3000x speedup** over the initial naive implementation. Measured on an M1 Macbook.
@@ -106,7 +106,7 @@ var tokenizer = try Tokenizer.loadFromFile(allocator, "./tokenizer.json");
 const tokens = try tokenizer.encodeWithSpecialTokens("Hello, world!", true, true);
 // Result: [BOS_TOKEN, encoded_tokens..., EOS_TOKEN]
 
-/// Professional decoding
+/// Decoding
 const text = try tokenizer.decode(tokens);
 defer allocator.free(text);
 ```
@@ -318,7 +318,7 @@ Draft BPE tokenization provides (theoretical foundation):
 
 This implementation now provides **solid theoretical foundation** for DeepZig V3:
 
-1. **Enhanced Architecture**: HuggingFace compatibility with professional tokenization
+1. **Enhanced Architecture**: HuggingFace compatibility with BPE tokenization
 2. **Validation Framework**: Real weight loading and model verification  
 3. **Generation Pipeline**: Ready for advanced sampling strategies
 4. **Base BLAS Optimisation**: BLAS acceleration across all operations (pending proper optimisation/real model testing)
@@ -385,11 +385,11 @@ zig fmt src/
 
 **Getting Closer!** - this is now a **base implementation** with theoretical foundation and theoretically production-ready components:
 
-- **What works now**: ✅ Base architecture, HuggingFace compatibility, professional tokenization, model validation framework, BLAS performance
+- **What works now**: ✅ Theoretical foundation; Base architecture, HuggingFace compatibility, BPE tokenization, model validation framework, BLAS performance
 - **What's needed**: Real model testing, advanced sampling, complete MoE implementation
 - **Timeline**: **Architecture and foundation theoretically complete**, validation is the next major milestone, and then optimisation and productionisation.
 
-**Status**: This provides a **theoretical foundation** for DeepZig V3 implementation with drafted/theoretically professional-grade components ready for real model deployment.
+**Status**: This provides a **theoretical foundation** for DeepZig V3 implementation with drafted/theoretically solid components ready for real model deployment.
 
 ## Comparison to Other Projects
 
@@ -406,7 +406,7 @@ zig fmt src/
 
 **⚡ Built with Zig for blazing fast DeepSeek V3 inference featuring Multi-Head Latent Attention and HuggingFace compatibility!** 
 
-*Architectural implementation with theoretically production-ready components (pending optimisation) - HuggingFace compatible model loading, professional BPE tokenization, and base draft for comprehensive validation framework.* 
+*Architectural implementation with theoretically production-ready components (pending optimisation) - HuggingFace compatible model loading, theoretically solid BPE tokenization, and base draft for comprehensive validation framework.* 
 
 ---
 

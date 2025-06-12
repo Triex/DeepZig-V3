@@ -46,7 +46,7 @@ A **DRAFT implementation** of DeepSeek V3 in Zig to create a high-performance, w
 
 **Performance Update**: ~~Current naive algorithms are ~1000x slower than optimized BLAS~~ **MLA attention architecture with BLAS integration now complete.** Matrix multiplication: **2.1ms for 1024×1024** at **1143 GFLOPS**, with peak **1143 GFLOPS at 512×512** on an M1 MacBook Pro under heavy load. This represents a ~**3000x speedup** over our initial naive implementation. See [experimental benchmarks](experimental/README.md#performance-notes) for detailed performance data.
 
-**⚠️ Important**: This is a **draft implementation** following DeepSeek V3 paper specifications with foundational components. Architecture is complete with drafted HuggingFace compatibility, drafted professional tokenization, and drafted model validation framework. Draft validation shows strong foundation (7/8 tests passing, 84.4% confidence) with optimization opportunities identified.
+**⚠️ Important**: This is a **draft implementation** following DeepSeek V3 paper specifications with foundational components. Architecture is complete with drafted HuggingFace compatibility, drafted theoretically solid tokenization, and drafted model validation framework. Draft validation shows strong foundation (7/8 tests passing, 84.4% confidence) with optimization opportunities identified.
 
 ## Why This Matters
 
