@@ -3,13 +3,15 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const ArrayList = std.ArrayList;
 const json = std.json;
 
 const Backend = @import("backend.zig").Backend;
+const tensor = @import("tensor.zig");
+const FloatTensor = tensor.Tensor(.f32);
 const CoreError = @import("root.zig").CoreError;
-const FloatTensor = @import("tensor.zig").FloatTensor;
+const Shape = tensor.Shape;
 pub const ModelConfig = @import("config.zig").ModelConfig;
-const Shape = @import("tensor.zig").Shape;
 const Tokenizer = @import("tokenizer.zig").Tokenizer;
 const Transformer = @import("transformer.zig").Transformer;
 
@@ -137,6 +139,49 @@ pub const Model = struct {
         const default_config = ModelConfig.defaultDeepSeekV3();
         const tokenizer = try Tokenizer.init(allocator, default_config.vocab_size);
         return try Self.loadFromSafetensorsWithConfig(allocator, path, default_config, tokenizer, backend);
+    }
+    
+    /// Initialize model from provided configuration
+    /// Creates a model with random weights based on the configuration
+    pub fn initFromConfig(allocator: Allocator, config: *ModelConfig) !Self {
+        std.log.info("🔧 Initializing model from config: {}", .{config});
+        
+        // Create backend with CPU for training
+        const backend = Backend.init(allocator, .cpu, 0);
+        
+        // Create tokenizer
+        const tokenizer = try Tokenizer.init(allocator, config.vocab_size);
+        
+        // Initialize transformer with the config
+        const transformer = try Transformer.init(allocator, config.*, backend);
+        
+        // Create embedding layer
+        const embed_dims = [_]usize{ config.vocab_size, config.hidden_size };
+        var embed_tokens = try FloatTensor.init(allocator, &embed_dims);
+        try initializeEmbedding(&embed_tokens);
+        
+        // Create embedding positions (optional)
+        const embed_positions: ?FloatTensor = null;
+        
+        // Create output layers
+        const norm_dims = [_]usize{ config.hidden_size };
+        const norm = try FloatTensor.init(allocator, &norm_dims);
+        
+        const lm_head_dims = [_]usize{ config.hidden_size, config.vocab_size };
+        var lm_head = try FloatTensor.init(allocator, &lm_head_dims);
+        try initializeLinear(&lm_head);
+        
+        return Self{
+            .config = config.*,
+            .transformer = transformer,
+            .tokenizer = tokenizer,
+            .backend = backend,
+            .allocator = allocator,
+            .embed_tokens = embed_tokens,
+            .embed_positions = embed_positions,
+            .lm_head = lm_head,
+            .norm = norm,
+        };
     }
 
     /// Load model from safetensors file
@@ -324,9 +369,9 @@ pub const Model = struct {
             tensor_data,
         ) orelse blk: {
             std.log.warn("⚠️ Embedding weights not found, using random initialization", .{});
-            var tensor = try FloatTensor.init(allocator, &[_]usize{ config.vocab_size, config.hidden_size });
-            try initializeEmbedding(&tensor);
-            break :blk tensor;
+            var embed_tensor = try FloatTensor.init(allocator, &[_]usize{ config.vocab_size, config.hidden_size });
+            try initializeEmbedding(&embed_tensor);
+            break :blk embed_tensor;
         };
 
         // Load output head weights
@@ -337,9 +382,9 @@ pub const Model = struct {
             tensor_data,
         ) orelse blk: {
             std.log.warn("⚠️ LM head weights not found, using random initialization", .{});
-            var tensor = try FloatTensor.init(allocator, &[_]usize{ config.hidden_size, config.vocab_size });
-            try initializeLinear(&tensor);
-            break :blk tensor;
+            var lm_head_tensor = try FloatTensor.init(allocator, &[_]usize{ config.hidden_size, config.vocab_size });
+            try initializeLinear(&lm_head_tensor);
+            break :blk lm_head_tensor;
         };
 
         // Load final norm weights
@@ -385,7 +430,7 @@ pub const Model = struct {
         std.log.debug("Loading tensor: {s}, dtype: {s}, shape: {any}", .{ tensor_name, tensor_info.dtype, tensor_info.shape });
 
         // Create tensor with correct shape
-        var tensor = try FloatTensor.init(allocator, tensor_info.shape);
+        var t_tensor = try FloatTensor.init(allocator, tensor_info.shape);
 
         // Extract data from the buffer
         const start_offset = tensor_info.data_offsets[0];
@@ -393,18 +438,12 @@ pub const Model = struct {
         const data_slice = tensor_data[start_offset..end_offset];
 
         // Convert data based on dtype
-        if (std.mem.eql(u8, tensor_info.dtype, "F32")) {
-            // Direct copy for F32
-            const f32_data = std.mem.bytesAsSlice(f32, data_slice);
-            @memcpy(tensor.data, f32_data);
-        } else if (std.mem.eql(u8, tensor_info.dtype, "F16")) {
-            // Convert F16 to F32
-            const f16_data = std.mem.bytesAsSlice(f16, data_slice);
-            for (f16_data, 0..) |val, i| {
-                tensor.data[i] = @floatCast(val);
-            }
-        } else if (std.mem.eql(u8, tensor_info.dtype, "BF16")) {
-            // Convert BF16 to F32 (simplified conversion)
+        if (std.mem.eql(u8, tensor_info.dtype, "F32") or
+            std.mem.eql(u8, tensor_info.dtype, "F16") or
+            std.mem.eql(u8, tensor_info.dtype, "BF16")) {
+            // Copy the data directly into the tensor
+            // TODO: Handle type conversion if needed
+            try t_tensor.copyFromBytes(data_slice);
             const u16_data = std.mem.bytesAsSlice(u16, data_slice);
             for (u16_data, 0..) |val, i| {
                 // BF16 to F32: shift left by 16 bits
@@ -478,12 +517,42 @@ pub const Model = struct {
 
     /// Free model memory
     pub fn deinit(self: *Self) void {
-        self.transformer.deinit();
+        // Deinit all owned resources
         self.tokenizer.deinit();
+        self.transformer.deinit();
+        self.backend.deinit();
         self.embed_tokens.deinit();
-        if (self.embed_positions) |*pos| pos.deinit();
-        self.lm_head.deinit();
+        
+        if (self.embed_positions) |positions| {
+            positions.deinit();
+        }
+        
         self.norm.deinit();
+        self.lm_head.deinit();
+    }
+    
+    /// Returns an ArrayList containing all trainable parameters of the model
+    /// The caller owns the ArrayList but not the tensors within
+    pub fn parameters(self: *Self) !ArrayList(*tensor.Tensor(.f32)) {
+        var params = ArrayList(*tensor.Tensor(.f32)).init(self.allocator);
+        errdefer params.deinit();
+        
+        // Add embedding parameters
+        try params.append(&self.embed_tokens);
+        
+        // Add transformer parameters
+        var transformer_params = try self.transformer.parameters();
+        defer transformer_params.deinit();
+        
+        for (transformer_params.items) |param| {
+            try params.append(param);
+        }
+        
+        // Add output layer parameters
+        try params.append(&self.norm);
+        try params.append(&self.lm_head);
+        
+        return params;
     }
 
     /// Simple text generation function for testing
@@ -654,26 +723,55 @@ pub const Model = struct {
 };
 
 // Initialize embedding with small random values
-fn initializeEmbedding(tensor: *FloatTensor) !void {
+fn initializeEmbedding(t: *FloatTensor) !void {
     var rng = std.Random.DefaultPrng.init(42);
     const random = rng.random();
 
-    for (tensor.data) |*val| {
-        val.* = (random.float(f32) - 0.5) * 0.02; // Small random values
+    // Initialize embedding layer uniformly between -0.02 and 0.02
+    const shape_dims = t.getDimensions();
+    var values = try t.asType(f32);
+    defer values.deinit();
+    
+    var total_elements: usize = 1;
+    for (shape_dims) |dim| {
+        total_elements *= dim;
+    }
+    
+    var data = try values.getData(f32);
+    
+    var i: usize = 0;
+    while (i < total_elements) : (i += 1) {
+        data[i] = random.float(f32) * 0.04 - 0.02; // Range: [-0.02, 0.02]
     }
 }
 
 // Initialize linear layer with Xavier initialization
-fn initializeLinear(tensor: *FloatTensor) !void {
+fn initializeLinear(t: *FloatTensor) !void {
     var rng = std.Random.DefaultPrng.init(123);
     const random = rng.random();
 
-    const fan_in = tensor.shape.dims[0];
-    const fan_out = tensor.shape.dims[1];
-    const limit = std.math.sqrt(6.0 / @as(f32, @floatFromInt(fan_in + fan_out)));
-
-    for (tensor.data) |*val| {
-        val.* = (random.float(f32) - 0.5) * 2.0 * limit;
+    // Xavier/Glorot initialization
+    const shape_dims = t.getDimensions();
+    var values = try t.asType(f32);
+    defer values.deinit();
+    
+    if (shape_dims.len != 2) return error.InvalidShape;
+    
+    const fan_in = shape_dims[0];
+    const fan_out = shape_dims[1];
+    const std_dev = @sqrt(2.0 / @as(f32, @floatFromInt(fan_in + fan_out)));
+    
+    var total_elements: usize = 1;
+    for (shape_dims) |dim| {
+        total_elements *= dim;
+    }
+    
+    var data = try values.getData(f32);
+    
+    var i: usize = 0;
+    while (i < total_elements) : (i += 1) {
+        // Normal distribution with mean=0, std_dev calculated above
+        data[i] = random.floatNorm(f32) * std_dev;
     }
 }
 

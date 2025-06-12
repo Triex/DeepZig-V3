@@ -163,6 +163,72 @@ pub fn build(b: *std.Build) void {
 
     const validation_run_step = b.step("validate", "Run comprehensive validation suite");
     validation_run_step.dependOn(&validation_run_cmd.step);
+
+    // Add dedicated MoE test executable
+    const moe_test_exe = b.addExecutable(.{
+        .name = "moe-test",
+        .root_source_file = b.path("src/test_moe.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    // Apply optimizations to MoE tests
+    configureOptimizations(moe_test_exe, optimize);
+
+    // Add core modules
+    moe_test_exe.root_module.addImport("deepseek_core", deepseek_core);
+
+    // Link BLAS for MoE tests
+    configureBlas(moe_test_exe, target);
+
+    b.installArtifact(moe_test_exe);
+
+    // Main MoE test step
+    const moe_test_run_cmd = b.addRunArtifact(moe_test_exe);
+    moe_test_run_cmd.step.dependOn(b.getInstallStep());
+    if (b.args) |args| {
+        moe_test_run_cmd.addArgs(args);
+    }
+
+    const moe_test_step = b.step("test-moe", "Run Mixture of Experts (MoE) test suite");
+    moe_test_step.dependOn(&moe_test_run_cmd.step);
+
+    // Create training module
+    const training_module = b.addModule("training", .{
+        .root_source_file = b.path("src/training/root.zig"),
+    });
+    // Training module depends on core
+    training_module.addImport("deepseek_core", deepseek_core);
+
+    // Add native Zig training executable
+    const train_medium_exe = b.addExecutable(.{
+        .name = "train-medium",
+        .root_source_file = b.path("src/train_medium.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    // Apply optimizations to training
+    configureOptimizations(train_medium_exe, optimize);
+
+    // Add modules to train_medium
+    train_medium_exe.root_module.addImport("deepseek_core", deepseek_core);
+    train_medium_exe.root_module.addImport("training", training_module);
+
+    // Link BLAS for training
+    configureBlas(train_medium_exe, target);
+
+    b.installArtifact(train_medium_exe);
+
+    // Main training step
+    const train_medium_run_cmd = b.addRunArtifact(train_medium_exe);
+    train_medium_run_cmd.step.dependOn(b.getInstallStep());
+    if (b.args) |args| {
+        train_medium_run_cmd.addArgs(args);
+    }
+
+    const train_medium_step = b.step("train-medium", "Run native Zig training for the medium model");
+    train_medium_step.dependOn(&train_medium_run_cmd.step);
 }
 
 /// Configure optimizations for maximum performance

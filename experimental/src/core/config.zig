@@ -149,6 +149,11 @@ pub const ModelConfig = struct {
         return ModelConfig{};
     }
 
+    /// Alias for defaultDeepSeekV3() to maintain API compatibility
+    pub fn deepseekV3Default() ModelConfig {
+        return ModelConfig{};
+    }
+
     /// Get tiny test configuration for development
     pub fn tinyTest() ModelConfig {
         return ModelConfig{
@@ -189,6 +194,36 @@ pub const ModelConfig = struct {
             .first_k_dense_replace = 1,
             .moe_intermediate_size = 512,
         };
+    }
+    
+    /// Configuration for the medium-sized model
+    /// Returns a heap-allocated config that must be freed with deinit()
+    pub fn mediumConfig(allocator: Allocator) !*ModelConfig {
+        const config = try allocator.create(ModelConfig);
+        config.* = ModelConfig{
+            .vocab_size = 32000,
+            .hidden_size = 2048,
+            .intermediate_size = 5632,
+            .num_hidden_layers = 24,
+            .num_attention_heads = 32,
+            .num_key_value_heads = 32,
+            .max_position_embeddings = 8192,
+            .qk_nope_head_dim = 48,
+            .qk_rope_head_dim = 16,
+            .v_head_dim = 64,
+            .num_experts = 16,
+            .num_experts_per_token = 4,
+            .moe_layer_freq = 2,
+            .first_k_dense_replace = 2,
+            .moe_intermediate_size = 4096,
+        };
+        return config;
+    }
+    
+    /// Free a heap-allocated config
+    pub fn deinit(self: *ModelConfig) void {
+        _ = self; // Currently unused, but kept for API consistency
+        // Free any allocated resources here if needed in the future
     }
 
     /// Validate configuration for consistency

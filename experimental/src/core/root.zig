@@ -7,6 +7,7 @@ pub const Attention = @import("attention.zig").Attention;
 pub const Backend = @import("backend.zig").Backend;
 pub const blas = @import("blas.zig");
 pub const Config = @import("config.zig").Config;
+pub const config = @import("config.zig");
 pub const math = @import("math/root.zig");
 pub const memory = @import("memory.zig");
 pub const Model = @import("model.zig").Model;
@@ -23,7 +24,8 @@ pub const createVector = tensor.createVector;
 pub const benchmarkTensorOps = tensor.benchmarkTensorOps;
 pub const TensorDType = @import("tensor.zig").TensorDType;
 pub const TensorShape = @import("tensor.zig").TensorShape;
-pub const Tokenizer = @import("tokenizer.zig").Tokenizer;
+pub const tokenizer = @import("tokenizer.zig");
+pub const Tokenizer = tokenizer.Tokenizer;
 pub const Transformer = @import("transformer.zig").Transformer;
 
 // Generation pipeline
@@ -33,10 +35,10 @@ pub const Generation = struct {
 
     const Self = @This();
 
-    pub fn init(model: *Model, tokenizer: *Tokenizer) Self {
+    pub fn init(model: *Model, tokenizer_instance: *Tokenizer) Self {
         return Self{
             .model = model,
-            .tokenizer = tokenizer,
+            .tokenizer = tokenizer_instance,
         };
     }
 
@@ -121,8 +123,8 @@ pub fn deinit() void {
 
 // Tests for new components
 test "ModelConfig validation" {
-    const config = ModelConfig.defaultDeepSeekV3();
-    try config.validate();
+    const test_config = ModelConfig.defaultDeepSeekV3();
+    try test_config.validate();
 }
 
 test "Generation pipeline init" {
@@ -130,15 +132,15 @@ test "Generation pipeline init" {
 
     // We can't easily test the full pipeline without a real model,
     // but we can test the basic structure
-    const backend_instance = Backend.init(.cpu);
+    const backend_instance = Backend.init(testing.allocator, .cpu, 0);
 
     var model = try Model.loadDefault(testing.allocator, backend_instance);
     defer model.deinit();
 
-    var tokenizer = try Tokenizer.init(testing.allocator, 1000);
-    defer tokenizer.deinit();
+    var tokenizer_obj = try Tokenizer.init(testing.allocator, 1000);
+    defer tokenizer_obj.deinit();
 
-    var generator = Generation.init(&model, &tokenizer);
+    var generator = Generation.init(&model, &tokenizer_obj);
     const result = try generator.generateGreedy("Hello", 10);
     defer testing.allocator.free(result);
 

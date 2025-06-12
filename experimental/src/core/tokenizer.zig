@@ -1,6 +1,30 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2025 TriexDev
+
 const std = @import("std");
 const json = std.json;
 const Allocator = std.mem.Allocator;
+
+/// Helper function to escape JSON strings
+fn escapeJsonString(writer: anytype, string: []const u8) !void {
+    for (string) |c| {
+        switch (c) {
+            '\"' => try writer.writeAll("\\\""),
+            '\\' => try writer.writeAll("\\\\"),
+            '\n' => try writer.writeAll("\\n"),
+            '\r' => try writer.writeAll("\\r"),
+            '\t' => try writer.writeAll("\\t"),
+            12 => try writer.writeAll("\\f"), // Form feed = ASCII 12
+            8 => try writer.writeAll("\\b"), // Backspace = ASCII 8
+            else => if (c < 32) {
+                // Control characters need unicode escape
+                try writer.print("\\u{x:0>4}", .{@as(u16, c)});
+            } else {
+                try writer.writeByte(c);
+            },
+        }
+    }
+}
 
 /// BPE (Byte Pair Encoding) Tokenizer for DeepSeek V3
 /// Supports loading from HuggingFace tokenizer.json format
@@ -331,6 +355,128 @@ pub const Tokenizer = struct {
         unk_token_id: u32,
         pad_token_id: ?u32,
     };
+
+    /// Training options for creating a tokenizer from a dataset
+    pub const TrainingOptions = struct {
+        vocab_size: u32 = 32000,
+        model_type: enum { bpe } = .bpe,
+    };
+
+    /// Train a new tokenizer from a dataset
+    pub fn trainFromDataset(allocator: Allocator, data_loader: anytype, options: TrainingOptions) !Self {
+        std.log.info("🔤 Training BPE tokenizer from dataset with vocab size: {}", .{options.vocab_size});
+
+        // Initialize with basic tokenizer first
+        var tokenizer = try Self.init(allocator, options.vocab_size);
+
+        // In a real implementation, we would scan the dataset to find frequent tokens,
+        // build merge rules, etc. For this experimental version, we'll just use the basic
+        // tokenizer with ASCII characters.
+        _ = data_loader; // Silence unused parameter warning
+
+        std.log.info("✅ Tokenizer training completed with {} vocab entries", .{tokenizer.token_to_id.count()});
+        return tokenizer;
+    }
+
+    /// Save tokenizer to a HuggingFace compatible tokenizer.json file
+    pub fn saveToFile(self: *Self, tokenizer_path: []const u8) !void {
+        std.log.info("💾 Saving tokenizer to: {s}", .{tokenizer_path});
+
+        // Create directory path if it doesn't exist
+        const dir_path = std.fs.path.dirname(tokenizer_path) orelse "";
+        if (dir_path.len > 0) {
+            std.fs.cwd().makePath(dir_path) catch |err| {
+                std.log.warn("⚠️ Failed to create directory: {s}, error: {}", .{ dir_path, err });
+                // Continue even if directory creation fails
+            };
+        }
+
+        // Create or overwrite the file
+        const file = try std.fs.cwd().createFile(tokenizer_path, .{});
+        defer file.close();
+
+        // Create JSON writer
+        var buffered_writer = std.io.bufferedWriter(file.writer());
+        var writer = buffered_writer.writer();
+
+        // Write JSON header
+        try writer.writeAll("{\n");
+        try writer.writeAll("  \"version\": \"1.0\",\n");
+        try writer.writeAll("  \"truncation\": null,\n");
+        try writer.writeAll("  \"padding\": null,\n");
+
+        // Write model type and vocabulary
+        try writer.writeAll("  \"model\": {\n");
+        try writer.writeAll("    \"type\": \"bpe\",\n");
+        try writer.writeAll("    \"vocab\": {\n");
+
+        // Write vocabulary entries
+        var first_entry = true;
+        var id_iter = self.id_to_token.iterator();
+        while (id_iter.next()) |entry| {
+            if (entry.key_ptr.* == self.bos_token_id or
+                entry.key_ptr.* == self.eos_token_id or
+                entry.key_ptr.* == self.unk_token_id or
+                (self.pad_token_id != null and entry.key_ptr.* == self.pad_token_id.?))
+            {
+                // Skip special tokens, they will be added separately
+                continue;
+            }
+
+            // Add comma if not the first entry
+            if (!first_entry) {
+                try writer.writeAll(",\n");
+            }
+            first_entry = false;
+
+            // Write token and its ID
+            const token = entry.value_ptr.*;
+            try writer.writeAll("      \"");
+            try escapeJsonString(writer, token);
+            try writer.print("\": {}", .{entry.key_ptr.*});
+        }
+
+        try writer.writeAll("\n    },\n");
+        try writer.writeAll("    \"merges\": []\n");
+        try writer.writeAll("  },\n");
+
+        // Write special tokens
+        try writer.writeAll("  \"special_tokens\": {\n");
+        try writer.writeAll("    \"bos_token\": \"<s>\",\n");
+        try writer.writeAll("    \"eos_token\": \"</s>\",\n");
+        try writer.writeAll("    \"unk_token\": \"<unk>\",\n");
+        if (self.pad_token_id != null) {
+            try writer.writeAll("    \"pad_token\": \"<pad>\",\n");
+        }
+        try writer.writeAll("  },\n");
+
+        // Write added tokens section for special tokens
+        try writer.writeAll("  \"added_tokens\": [\n");
+        try writer.writeAll("    { \"id\": ");
+        try writer.print("{}", .{self.bos_token_id});
+        try writer.writeAll(", \"content\": \"<s>\", \"single_word\": false, \"special\": true },\n");
+        try writer.writeAll("    { \"id\": ");
+        try writer.print("{}", .{self.eos_token_id});
+        try writer.writeAll(", \"content\": \"</s>\", \"single_word\": false, \"special\": true },\n");
+        try writer.writeAll("    { \"id\": ");
+        try writer.print("{}", .{self.unk_token_id});
+        try writer.writeAll(", \"content\": \"<unk>\", \"single_word\": false, \"special\": true }\n");
+
+        if (self.pad_token_id != null) {
+            try writer.writeAll(",\n    { \"id\": ");
+            try writer.print("{}", .{self.pad_token_id.?});
+            try writer.writeAll(", \"content\": \"<pad>\", \"single_word\": false, \"special\": true }\n");
+        }
+        try writer.writeAll("  ]\n");
+
+        // End JSON
+        try writer.writeAll("}\n");
+
+        // Flush the buffered writer
+        try buffered_writer.flush();
+
+        std.log.info("✅ Tokenizer saved successfully to {s}", .{tokenizer_path});
+    }
 };
 
 // Tests

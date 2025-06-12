@@ -410,7 +410,7 @@ test "transformer layer initialization" {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    const config = model.ModelConfig.deepseekV3Default();
+    const config = model.ModelConfig{}; // Use default config values
     const backend = Backend{
         .type = .cpu,
         .device_id = 0,
@@ -430,7 +430,7 @@ test "transformer initialization" {
     const allocator = gpa.allocator();
 
     // Use smaller config for testing
-    var config = model.ModelConfig.deepseekV3Default();
+    var config = model.ModelConfig{}; // Use default config values
     config.num_hidden_layers = 4; // Reduce for testing
 
     const backend = Backend{
