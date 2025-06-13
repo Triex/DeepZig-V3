@@ -32,13 +32,6 @@ pub const BackendConfig = backend_detection_module.BackendConfig;
 pub const detectHardware = backend_detection_module.detectHardware;
 pub const getOptimalConfig = backend_detection_module.getOptimalConfig;
 
-// Re-export CUDA backend
-const cuda_backend_module = @import("cuda_backend.zig");
-pub const CudaDevice = cuda_backend_module.CudaDevice;
-pub const CudaMemoryPool = cuda_backend_module.CudaMemoryPool;
-pub const CudaKernelLauncher = cuda_backend_module.CudaKernelLauncher;
-pub const initCudaBackend = cuda_backend_module.initCudaBackend;
-
 // Legacy compatibility exports
 pub const dataset = @import("dataset.zig");
 pub const TextDataset = dataset.TextDataset;

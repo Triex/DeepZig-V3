@@ -22,7 +22,7 @@ const Config = struct {
 
     const Backend = enum { cpu, metal, cuda, webgpu };
     const ModelSize = enum { tiny, small, full };
-    
+
     /// Free any memory allocated for this config
     pub fn deinit(self: *Config) void {
         if (self.allocator) |alloc| {
@@ -30,13 +30,13 @@ const Config = struct {
             if (!std.mem.eql(u8, self.host, "127.0.0.1")) {
                 alloc.free(self.host);
             }
-            
+
             // Free model path if it exists
             if (self.model_path) |path| {
                 alloc.free(path);
                 self.model_path = null;
             }
-            
+
             self.allocator = null;
         }
     }
@@ -83,13 +83,18 @@ pub fn main() !void {
     // Test generation
     print("\n🧪 Testing text generation...\n", .{});
     const test_prompt = "Hello, world!";
-    const generated = try model.generateText(test_prompt, 10);
+
+    // Create a generation instance using the existing Generation struct
+    var generator = deepseek_core.Generation.init(&model, &model.tokenizer);
+
+    // Use the proper generation method
+    const generated = try generator.generate(test_prompt, 10, 0.7, 50);
     defer allocator.free(generated);
     print("🎉 Generated text: '{s}'\n", .{generated});
 
     print("\n✅ Model loaded successfully!\n", .{});
     print("💡 Run with --no-server to skip web server\n", .{});
-    
+
     // Skip server for now - just test the model
     return;
 
@@ -101,7 +106,7 @@ pub fn main() !void {
     //     .max_concurrent_requests = config.max_concurrent_requests,
     // });
     // defer server.deinit();
-    // 
+    //
     // print("✅ Server ready! Send requests to http://{s}:{d}\n", .{ config.host, config.port });
     // print("   Endpoints:\n", .{});
     // print("   - POST /v1/chat/completions (OpenAI compatible)\n", .{});

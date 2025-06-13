@@ -299,7 +299,10 @@ pub fn Tensor(comptime dtype: TensorDType) type {
                 switch (DataType) {
                     f32 => {
                         blas_context.matmul(f32, self.data, other.data, result.data, dims);
-                        logDebug("✅ BLAS-accelerated f32 matrix multiplication: {}x{} * {}x{}", .{ m, k, k, n });
+                        // Reduced logging to prevent spam - only log large operations
+        if (m * k * n > 100000) {
+            logDebug("✅ BLAS-accelerated f32 matrix multiplication: {}x{} * {}x{}", .{ m, k, k, n });
+        }
                     },
                     f64 => {
                         blas_context.matmul(f64, self.data, other.data, result.data, dims);

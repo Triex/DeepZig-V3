@@ -230,7 +230,7 @@ pub const ModelConfig = struct {
         };
         return config;
     }
-    
+
     /// Create small config (~5M params) for quick experimentation
     /// Suitable for frequent iterations and baseline testing.
     /// Matches Python "small" config for efficient development.
@@ -286,7 +286,7 @@ pub const ModelConfig = struct {
         };
         return config;
     }
-    
+
     /// Create large config (~125M params, GPT-2 Small equivalent)
     /// For high-quality outputs requiring more compute resources.
     /// Capable of sophisticated reasoning and general task performance.
@@ -311,6 +311,36 @@ pub const ModelConfig = struct {
             .moe_layer_freq = 2,
             .first_k_dense_replace = 4,
             .moe_intermediate_size = 6144,
+        };
+        return config;
+    }
+
+    /// Create conversational config (~60M params) for chat applications
+    /// Optimized for natural conversations, tool calling, and instruction following.
+    /// Based on the conversational_model_plan.md reference architecture.
+    /// Uses RoPE, RMS normalization, SwiGLU, and grouped query attention.
+    /// Sized for viable conversation quality while remaining efficient.
+    ///
+    /// Returns: Allocated config that must be freed with deinit()
+    /// Memory: ~240MB model size when loaded
+    pub fn conversationalConfig(allocator: Allocator) !*ModelConfig {
+        const config = try allocator.create(ModelConfig);
+        config.* = ModelConfig{
+            .vocab_size = 32000,        // Large vocab for conversation tokens
+            .hidden_size = 768,         // Larger for better conversation quality
+            .intermediate_size = 2304,  // SwiGLU: hidden * 3
+            .num_hidden_layers = 12,    // More layers for better reasoning
+            .num_attention_heads = 12,  // More attention heads for context
+            .num_key_value_heads = 12,  // Full attention (not grouped for quality)
+            .max_position_embeddings = 4096,  // Support very long conversations
+            .qk_nope_head_dim = 32,     // MLA dimensions
+            .qk_rope_head_dim = 32,     // RoPE for positional understanding
+            .v_head_dim = 64,           // Value head dimension
+            .num_experts = 1,           // Dense model (no MoE for efficiency)
+            .num_experts_per_token = 1,
+            .moe_layer_freq = 1,        // No MoE layers
+            .first_k_dense_replace = 0,
+            .moe_intermediate_size = 2304,
         };
         return config;
     }

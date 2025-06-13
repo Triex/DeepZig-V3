@@ -2,8 +2,8 @@
 
 A high-performance implementation of DeepSeek V3 in [Zig](https://ziglang.org/) for blazingly fast inference.
 
-> **✅ Status: Enhanced Implementation with Real-World Features** 
-> 
+> **✅ Status: Enhanced Draft with Real-World Features**
+>
 > This project provides a **theoretical foundation** of DeepZig V3 with significant architectural progress & theoretically production-ready components:
 > - ✅ **Multi-Head Latent Attention (MLA)** - Core DeepSeek V3 innovation architecturally implemented
 > - ✅ **Base Configuration System** - HuggingFace config.json loading with comprehensive draft validation
@@ -20,11 +20,11 @@ A high-performance implementation of DeepSeek V3 in [Zig](https://ziglang.org/) 
 > - ✅ **RoPE (Rotary Position Encoding)** for position-aware attention
 > - ✅ **KV Cache** for efficient inference
 > - ✅ **RMS Layer Normalization** following DeepSeek V3 specifications
-> 
+>
 > **Latest Achievement**: Draft production-ready components with HuggingFace compatibility, BPE tokenization, and model validation framework<br/>Multi-Head Latent Attention mechanism architecturally complete with RoPE, KV caching, and BLAS acceleration<br/>
 > **Performance Status**: 1160+ GFLOPS with Apple Accelerate backend working (measured on Apple M1 Macbook)<br/>
 > **Implementation Status**: ⚡ **Enhanced practical implementation to theoretically solid foundation - ready for real model loading and validation testing**<br/>
-> 
+>
 > See [Performance Results](#performance-notes) for detailed benchmarks.
 
 ## Overview
@@ -32,7 +32,7 @@ A high-performance implementation of DeepSeek V3 in [Zig](https://ziglang.org/) 
 This implementation leverages Zig's unique advantages for systems programming to create a high-performance LLM inference engine with **drafted features**:
 
 - **Zero-cost abstractions** with compile-time optimization
-- **Direct hardware access** for SIMD and platform-specific optimizations  
+- **Direct hardware access** for SIMD and platform-specific optimizations
 - **Manual memory management** without garbage collection pauses
 - **Single binary deployment** with no runtime dependencies
 - **Cross-platform compilation** for multiple architectures
@@ -68,22 +68,22 @@ pub const ModelConfig = struct {
     hidden_size: u32 = 7168,
     num_hidden_layers: u32 = 61,
     num_attention_heads: u32 = 128,
-    
+
     // MLA dimensions
     qk_nope_head_dim: u32 = 128,
     qk_rope_head_dim: u32 = 64,
     v_head_dim: u32 = 128,
-    
+
     // MoE configuration
     num_experts: u32 = 256,
     num_experts_per_token: u32 = 8,
     moe_layer_freq: u32 = 1,
-    
+
     // Generation parameters
     temperature: f32 = 0.7,
     top_p: f32 = 0.9,
     top_k: u32 = 50,
-    
+
     /// Automatic validation
     pub fn validate(self: *const ModelConfig) !void
 };
@@ -240,21 +240,21 @@ pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
-    
+
     // Initialize backend
     const backend = deepseek.Backend.init(.cpu);
-    
+
     // Load model from HuggingFace directory
     var model = try deepseek.Model.loadFromDirectory(
-        allocator, 
+        allocator,
         "./deepseek-v3-7b-chat",  // HuggingFace model directory
         backend
     );
     defer model.deinit();
-    
+
     // Initialize generation
     var generator = deepseek.Generation.init(&model, &model.tokenizer);
-    
+
     // Generate response
     const response = try generator.generate(
         "Explain the principles of quantum entanglement",
@@ -263,7 +263,7 @@ pub fn main() !void {
         .top_k = 50
     );
     defer allocator.free(response);
-    
+
     std.log.info("Generated: {s}", .{response});
 }
 ```
@@ -283,7 +283,7 @@ const tokenizer = try deepseek.Tokenizer.loadFromFile(allocator, "./tokenizer.js
 const token_info = tokenizer.getTokenInfo();
 std.log.info("Tokenizer info: BOS={}, EOS={}, vocab_size={}", .{
     token_info.bos_token_id,
-    token_info.eos_token_id, 
+    token_info.eos_token_id,
     token_info.vocab_size
 });
 ```
@@ -320,7 +320,7 @@ Draft BPE tokenization provides (theoretical foundation):
 This implementation now provides **solid theoretical foundation** for DeepZig V3:
 
 1. **Enhanced Architecture**: HuggingFace compatibility with BPE tokenization
-2. **Validation Framework**: Real weight loading and model verification  
+2. **Validation Framework**: Real weight loading and model verification
 3. **Generation Pipeline**: Ready for advanced sampling strategies
 4. **Base BLAS Optimisation**: BLAS acceleration across all operations (pending proper optimisation/real model testing)
 5. **Comprehensive Testing Drafts**: Test coverage for critical components
@@ -358,16 +358,16 @@ The training setup now supports multiple model sizes for scalable experimentatio
 
 ```bash
 # Ultra-fast test run (< 1M params)
-zig build train-medium -- --model-size test
+zig build train-model -- --model-size test
 
 # Quick training run (~5M params)
-zig build train-medium -- --model-size small
+zig build train-model -- --model-size small
 
 # Default training run (~50M params)
-zig build train-medium
+zig build train-model
 
 # High-quality training run (~125M params)
-zig build train-medium -- --model-size large
+zig build train-model -- --model-size large
 ```
 
 ### Model Size Specifications
@@ -388,7 +388,7 @@ Each model configuration automatically adjusts batch size and other training par
 **Performance Results** (Apple M1 MacBook Pro under extreme heavy load):
 - **Matrix 256×256**: 0.0ms/iter, **937 GFLOPS**
 - **Matrix 512×512**: 0.2ms/iter, **1143 GFLOPS**
-- **Matrix 1024×1024**: 2.1ms/iter, **1164 GFLOPS** 
+- **Matrix 1024×1024**: 2.1ms/iter, **1164 GFLOPS**
 - **Matrix 2048×2048**: 20.9ms/iter, **823 GFLOPS**
 
 **Performance Achievement**: From **6418ms naive** → **2.1ms BLAS** = ~**3000x speedup** on matrix operations.
@@ -411,7 +411,7 @@ Each model configuration automatically adjusts batch size and other training par
 - **GPU Acceleration**: Backend stubs only - Metal/CUDA kernels not implemented
 - **WebSocket Streaming**: Basic structure only - real-time streaming not implemented
 
-## Is This Ready for Use? 
+## Is This Ready for Use?
 
 **Getting Closer!** - this is now a **base implementation** with theoretical foundation and theoretically production-ready components:
 
@@ -434,9 +434,9 @@ Each model configuration automatically adjusts batch size and other training par
 
 ---
 
-**⚡ Built with Zig for blazing fast DeepSeek V3 inference featuring Multi-Head Latent Attention and HuggingFace compatibility!** 
+**⚡ Built with Zig for blazing fast DeepSeek V3 inference featuring Multi-Head Latent Attention and HuggingFace compatibility!**
 
-*Architectural implementation with theoretically production-ready components (pending optimisation) - HuggingFace compatible model loading, theoretically solid BPE tokenization, and base draft for comprehensive validation framework.* 
+*Architectural implementation with theoretically production-ready components (pending optimisation) - HuggingFace compatible model loading, theoretically solid BPE tokenization, and base draft for comprehensive validation framework.*
 
 ---
 

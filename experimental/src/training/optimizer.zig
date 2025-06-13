@@ -16,7 +16,10 @@ const math = std.math;
 const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const backend_detection = @import("backend_detection.zig");
-const cuda_backend = @import("cuda_backend.zig");
+
+// Use the main core BLAS implementation instead of redundant cuda_backend
+const deepseek_core = @import("deepseek_core");
+const Blas = deepseek_core.blas.Blas;
 
 /// Optimizer configuration optimized for high-end hardware
 pub const OptimizerConfig = struct {
@@ -38,7 +41,7 @@ pub const OptimizerConfig = struct {
 
 /// Thread worker for parallel gradient updates
 const OptimizerWorker = struct {
-    thread: std.Thread,
+    thread: ?std.Thread = null,
     start_idx: usize,
     end_idx: usize,
     params: []f32,
@@ -49,8 +52,10 @@ const OptimizerWorker = struct {
     step_count: u64,
     learning_rate: f32,
     finished: std.atomic.Value(bool),
+    thread_running: std.atomic.Value(bool),
 
     fn workerThread(self: *OptimizerWorker) void {
+        defer self.thread_running.store(false, .seq_cst);
         self.updateParametersRange();
         self.finished.store(true, .seq_cst);
     }
@@ -167,61 +172,103 @@ pub const Optimizer = struct {
     loss_scale: f32 = 32768.0,
     fp16_gradients: ?[]f16 = null,
 
-    // CUDA backend
-    cuda_backend: ?cuda_backend.CudaKernelLauncher = null,
-    cuda_memory_pool: ?cuda_backend.CudaMemoryPool = null,
-    gpu_params: ?[]f32 = null,
-    gpu_gradients: ?[]f32 = null,
-
-    // Multi-threading
+    // Multi-threading with improved lifecycle management
     workers: ?[]OptimizerWorker = null,
-    thread_pool: ?std.Thread.Pool = null,
+    threads_active: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    is_initialized: bool = false,
 
     pub fn init(allocator: Allocator, config: OptimizerConfig) !Optimizer {
-        var optimizer = Optimizer{
+        const optimizer = Optimizer{
             .allocator = allocator,
             .config = config,
         };
-
-        // Initialize CUDA backend if available
-        if (config.use_cuda) {
-            const cuda_init = cuda_backend.initCudaBackend(allocator) catch |err| {
-                std.log.warn("Failed to initialize CUDA backend: {}", .{err});
-                return optimizer;
-            };
-
-            optimizer.cuda_backend = cuda_init.kernel_launcher;
-            optimizer.cuda_memory_pool = cuda_init.memory_pool;
-        }
 
         return optimizer;
     }
 
     pub fn deinit(self: *Optimizer) void {
-        if (self.params) |params| self.allocator.free(params);
-        if (self.gradients) |gradients| self.allocator.free(gradients);
-        if (self.momentum) |momentum| self.allocator.free(momentum);
-        if (self.velocity) |velocity| self.allocator.free(velocity);
-        if (self.fp16_gradients) |fp16_gradients| self.allocator.free(fp16_gradients);
+        // Prevent double-free
+        if (!self.is_initialized) {
+            return;
+        }
+
+        // Safely cleanup threads first with timeout
+        self.cleanupThreads();
+
+        // Defensive memory cleanup with null checks
+        if (self.params) |params| {
+            self.allocator.free(params);
+            self.params = null;
+        }
+        if (self.gradients) |gradients| {
+            self.allocator.free(gradients);
+            self.gradients = null;
+        }
+        if (self.momentum) |momentum| {
+            self.allocator.free(momentum);
+            self.momentum = null;
+        }
+        if (self.velocity) |velocity| {
+            self.allocator.free(velocity);
+            self.velocity = null;
+        }
+        if (self.fp16_gradients) |fp16_gradients| {
+            self.allocator.free(fp16_gradients);
+            self.fp16_gradients = null;
+        }
 
         if (self.workers) |workers| {
-            for (workers) |*worker| {
-                worker.thread.join();
-            }
             self.allocator.free(workers);
+            self.workers = null;
         }
 
-        if (self.cuda_backend) |*backend| {
-            backend.deinit();
-        }
+        // Mark as not initialized
+        self.is_initialized = false;
+    }
 
-        if (self.cuda_memory_pool) |*pool| {
-            pool.deinit();
+    fn cleanupThreads(self: *Optimizer) void {
+        if (self.workers) |workers| {
+            // Wait for any active threads to complete with timeout
+            if (self.threads_active.load(.seq_cst)) {
+                for (workers) |*worker| {
+                    // Wait for worker to finish with timeout
+                    var timeout_count: u32 = 0;
+                    while (worker.thread_running.load(.seq_cst) and timeout_count < 10000) { // 1 second timeout
+                        std.time.sleep(100_000); // 100 microseconds
+                        timeout_count += 1;
+                    }
+
+                    // Force thread to stop if timeout
+                    if (timeout_count >= 10000) {
+                        worker.thread_running.store(false, .seq_cst);
+                        worker.finished.store(true, .seq_cst);
+                    }
+
+                    // Join thread if it was spawned
+                    if (worker.thread) |thread| {
+                        thread.join();
+                        worker.thread = null;
+                    }
+                }
+                self.threads_active.store(false, .seq_cst);
+            }
+
+            // Clear all worker state to prevent use-after-free
+            for (workers) |*worker| {
+                worker.thread = null;
+                worker.thread_running.store(false, .seq_cst);
+                worker.finished.store(true, .seq_cst);
+            }
         }
     }
 
     /// Initialize optimizer state for given parameter count
     pub fn initializeState(self: *Optimizer, param_count: usize) !void {
+        // Prevent double initialization
+        if (self.is_initialized) {
+            return error.AlreadyInitialized;
+        }
+
         self.param_count = param_count;
 
         // Allocate CPU memory
@@ -242,15 +289,11 @@ pub const Optimizer = struct {
             @memset(self.fp16_gradients.?, 0.0);
         }
 
-        // GPU memory allocation
-        if (self.cuda_memory_pool) |*pool| {
-            const param_bytes = param_count * @sizeOf(f32);
-            self.gpu_params = @ptrCast(@alignCast(try pool.allocate(param_bytes)));
-            self.gpu_gradients = @ptrCast(@alignCast(try pool.allocate(param_bytes)));
-        }
-
         // Initialize worker threads
         try self.initializeWorkers();
+
+        // Mark as initialized
+        self.is_initialized = true;
     }
 
     fn initializeWorkers(self: *Optimizer) !void {
@@ -264,7 +307,7 @@ pub const Optimizer = struct {
             const end_idx = if (i == num_workers - 1) self.param_count else (i + 1) * params_per_worker;
 
             worker.* = OptimizerWorker{
-                .thread = undefined,
+                .thread = null, // Explicitly initialize to null
                 .start_idx = start_idx,
                 .end_idx = end_idx,
                 .params = self.params.?,
@@ -275,26 +318,22 @@ pub const Optimizer = struct {
                 .step_count = 0,
                 .learning_rate = 0,
                 .finished = std.atomic.Value(bool).init(false),
+                .thread_running = std.atomic.Value(bool).init(false),
             };
         }
     }
 
     /// Zero gradients efficiently
     pub fn zeroGrad(self: *Optimizer) !void {
-        if (self.config.use_cuda and self.cuda_backend != null) {
-            // Zero gradients on GPU
-            if (self.gpu_gradients) |gpu_grads| {
-                @memset(gpu_grads, 0.0);
-            }
+        if (self.gradients == null) return;
+
+        const gradients = self.gradients.?;
+
+        // Zero gradients on CPU using SIMD
+        if (self.config.use_avx2_simd and builtin.cpu.arch == .x86_64) {
+            self.zeroGradientsSIMD(gradients);
         } else {
-            // Zero gradients on CPU using SIMD
-            if (self.gradients) |gradients| {
-                if (self.config.use_avx2_simd and builtin.cpu.arch == .x86_64) {
-                    self.zeroGradientsSIMD(gradients);
-                } else {
-                    @memset(gradients, 0.0);
-                }
-            }
+            @memset(gradients, 0.0);
         }
 
         if (self.fp16_gradients) |fp16_grads| {
@@ -327,36 +366,24 @@ pub const Optimizer = struct {
 
         self.step_count += 1;
 
-        if (self.config.use_cuda and self.cuda_backend != null) {
-            try self.stepCUDA(learning_rate);
-        } else {
-            try self.stepCPU(learning_rate);
-        }
-    }
-
-    fn stepCUDA(self: *Optimizer, learning_rate: f32) !void {
-        if (self.cuda_backend == null) return error.CudaNotInitialized;
-
-        // Launch CUDA kernel for optimizer step
-        // This would be implemented with custom CUDA kernels
-
-        // For now, fall back to CPU implementation
         try self.stepCPU(learning_rate);
-
-        // Copy results back to GPU if needed
-        if (self.gpu_params) |gpu_params| {
-            @memcpy(gpu_params, self.params.?);
-        }
     }
 
     fn stepCPU(self: *Optimizer, learning_rate: f32) !void {
         if (self.workers == null) return error.WorkersNotInitialized;
+
+        // Ensure any previous threads are cleaned up
+        self.cleanupThreads();
+
+        // Mark threads as active
+        self.threads_active.store(true, .seq_cst);
 
         // Launch all worker threads
         for (self.workers.?) |*worker| {
             worker.step_count = self.step_count;
             worker.learning_rate = learning_rate;
             worker.finished.store(false, .seq_cst);
+            worker.thread_running.store(true, .seq_cst);
             worker.thread = try std.Thread.spawn(.{}, OptimizerWorker.workerThread, .{worker});
         }
 
@@ -365,8 +392,14 @@ pub const Optimizer = struct {
             while (!worker.finished.load(.seq_cst)) {
                 std.time.sleep(1000); // Sleep 1 microsecond
             }
-            worker.thread.join();
+            if (worker.thread) |thread| {
+                thread.join();
+                worker.thread = null;
+            }
         }
+
+        // Mark threads as inactive
+        self.threads_active.store(false, .seq_cst);
     }
 
     /// SIMD-accelerated gradient clipping
@@ -464,7 +497,7 @@ pub const Optimizer = struct {
             .step_count = self.step_count,
             .loss_scale = self.loss_scale,
             .param_count = self.param_count,
-            .using_cuda = self.cuda_backend != null,
+            .using_cuda = false,
             .num_workers = self.config.num_worker_threads,
         };
     }

@@ -22,29 +22,46 @@ pub fn build(b: *std.Build) void {
     // BLAS library configuration based on target platform
     configureBlas(exe, target);
 
-    // Add module dependencies
+    // Create the main module for DeepSeek core
     const deepseek_core = b.addModule("deepseek_core", .{
         .root_source_file = b.path("src/core/root.zig"),
     });
-    exe.root_module.addImport("deepseek_core", deepseek_core);
 
+    // Create backend modules
+    const cpu_backend = b.addModule("cpu_backend", .{
+        .root_source_file = b.path("src/backends/cpu/root.zig"),
+    });
+
+    const cuda_backend = b.addModule("cuda_backend", .{
+        .root_source_file = b.path("src/backends/cuda/root.zig"),
+    });
+
+    const metal_backend = b.addModule("metal_backend", .{
+        .root_source_file = b.path("src/backends/metal/root.zig"),
+    });
+
+    // Add backend dependencies to the core module
+    deepseek_core.addImport("cpu_backend", cpu_backend);
+    deepseek_core.addImport("cuda_backend", cuda_backend);
+    deepseek_core.addImport("metal_backend", metal_backend);
+
+    // Backend modules also need deepseek_core for shared types
+    cpu_backend.addImport("deepseek_core", deepseek_core);
+    cuda_backend.addImport("deepseek_core", deepseek_core);
+    metal_backend.addImport("deepseek_core", deepseek_core);
+
+    // Add module dependencies to main executable
+    exe.root_module.addImport("deepseek_core", deepseek_core);
+    exe.root_module.addImport("cpu_backend", cpu_backend);
+    exe.root_module.addImport("cuda_backend", cuda_backend);
+    exe.root_module.addImport("metal_backend", metal_backend);
+
+    // Add module dependencies
     const web_layer = b.addModule("web_layer", .{
         .root_source_file = b.path("src/web/root.zig"),
     });
     web_layer.addImport("deepseek_core", deepseek_core);
     exe.root_module.addImport("web_layer", web_layer);
-
-    const cpu_backend = b.addModule("cpu_backend", .{
-        .root_source_file = b.path("src/backends/cpu/root.zig"),
-    });
-    cpu_backend.addImport("deepseek_core", deepseek_core);
-    exe.root_module.addImport("cpu_backend", cpu_backend);
-
-    const metal_backend = b.addModule("metal_backend", .{
-        .root_source_file = b.path("src/backends/metal/root.zig"),
-    });
-    metal_backend.addImport("deepseek_core", deepseek_core);
-    exe.root_module.addImport("metal_backend", metal_backend);
 
     // Add Metal framework for macOS
     if (target.result.os.tag == .macos) {
@@ -127,7 +144,7 @@ pub fn build(b: *std.Build) void {
     configureBlas(blas_bench_exe, target);
 
     const blas_bench_run = b.addRunArtifact(blas_bench_exe);
-    const blas_bench_step = b.step("bench-blas", "Run BLAS-specific benchmarks");
+    const blas_bench_step = b.step("bench-blas", "Run BLAS performance benchmarks");
     blas_bench_step.dependOn(&blas_bench_run.step);
 
     // Ceate a validation test executable
@@ -201,34 +218,121 @@ pub fn build(b: *std.Build) void {
     training_module.addImport("deepseek_core", deepseek_core);
 
     // Add native Zig training executable
-    const train_medium_exe = b.addExecutable(.{
-        .name = "train-medium",
-        .root_source_file = b.path("src/train_medium.zig"),
+    const train_exe = b.addExecutable(.{
+        .name = "train-model",
+        .root_source_file = b.path("src/train.zig"),
         .target = target,
         .optimize = optimize,
     });
 
     // Apply optimizations to training
-    configureOptimizations(train_medium_exe, optimize);
+    configureOptimizations(train_exe, optimize);
 
-    // Add modules to train_medium
-    train_medium_exe.root_module.addImport("deepseek_core", deepseek_core);
-    train_medium_exe.root_module.addImport("training", training_module);
+    // Add modules to train
+    train_exe.root_module.addImport("deepseek_core", deepseek_core);
+    train_exe.root_module.addImport("training", training_module);
 
     // Link BLAS for training
-    configureBlas(train_medium_exe, target);
+    configureBlas(train_exe, target);
 
-    b.installArtifact(train_medium_exe);
+    b.installArtifact(train_exe);
 
     // Main training step
-    const train_medium_run_cmd = b.addRunArtifact(train_medium_exe);
-    train_medium_run_cmd.step.dependOn(b.getInstallStep());
+    const train_run_cmd = b.addRunArtifact(train_exe);
+    train_run_cmd.step.dependOn(b.getInstallStep());
     if (b.args) |args| {
-        train_medium_run_cmd.addArgs(args);
+        train_run_cmd.addArgs(args);
     }
 
-    const train_medium_step = b.step("train-medium", "Run native Zig training for the medium model");
-    train_medium_step.dependOn(&train_medium_run_cmd.step);
+    const train_step = b.step("train-model", "Run native Zig training for the medium model");
+    train_step.dependOn(&train_run_cmd.step);
+
+    // Add model size specific training commands
+    addTrainingCommands(b, train_exe);
+
+    // Add diagnostic executable for performance debugging
+    const diagnostic_exe = b.addExecutable(.{
+        .name = "diagnostic",
+        .root_source_file = b.path("bench/diagnostic.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    // Apply optimizations to diagnostic
+    configureOptimizations(diagnostic_exe, optimize);
+
+    // Add core modules to diagnostic
+    diagnostic_exe.root_module.addImport("deepseek_core", deepseek_core);
+
+    // Link BLAS for diagnostic
+    configureBlas(diagnostic_exe, target);
+
+    b.installArtifact(diagnostic_exe);
+
+    // Main diagnostic step
+    const diagnostic_run_cmd = b.addRunArtifact(diagnostic_exe);
+    diagnostic_run_cmd.step.dependOn(b.getInstallStep());
+    if (b.args) |args| {
+        diagnostic_run_cmd.addArgs(args);
+    }
+
+    const diagnostic_step = b.step("diagnostic", "Run performance diagnostic to identify issues");
+    diagnostic_step.dependOn(&diagnostic_run_cmd.step);
+
+    // Add large matrix test executable
+    const large_matrix_exe = b.addExecutable(.{
+        .name = "test-large-matrix",
+        .root_source_file = b.path("bench/test_large_matrix.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    // Apply optimizations to large matrix test
+    configureOptimizations(large_matrix_exe, optimize);
+
+    // Add core modules to large matrix test
+    large_matrix_exe.root_module.addImport("deepseek_core", deepseek_core);
+
+    // Link BLAS for large matrix test
+    configureBlas(large_matrix_exe, target);
+
+    b.installArtifact(large_matrix_exe);
+
+    // Main large matrix test step
+    const large_matrix_run_cmd = b.addRunArtifact(large_matrix_exe);
+    large_matrix_run_cmd.step.dependOn(b.getInstallStep());
+    if (b.args) |args| {
+        large_matrix_run_cmd.addArgs(args);
+    }
+
+    const large_matrix_step = b.step("test-large", "Run large matrix performance test");
+    large_matrix_step.dependOn(&large_matrix_run_cmd.step);
+
+    // Add CUDA GPU benchmark executable
+    const cuda_bench_exe = b.addExecutable(.{
+        .name = "cuda-gpu-benchmark",
+        .root_source_file = b.path("bench/cuda_bench.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    // Apply optimizations to CUDA benchmark
+    configureOptimizations(cuda_bench_exe, optimize);
+
+    // Add core modules to CUDA benchmark
+    cuda_bench_exe.root_module.addImport("deepseek_core", deepseek_core);
+
+    // Link BLAS for CUDA benchmark
+    configureBlas(cuda_bench_exe, target);
+
+    b.installArtifact(cuda_bench_exe);
+
+    // Main CUDA benchmark step
+    const cuda_bench_run_cmd = b.addRunArtifact(cuda_bench_exe);
+    cuda_bench_run_cmd.step.dependOn(b.getInstallStep());
+
+    const cuda_bench_step = b.step("bench-cuda", "Run CUDA GPU benchmark");
+    cuda_bench_step.dependOn(&cuda_bench_run_cmd.step);
 }
 
 /// Configure optimizations for maximum performance
@@ -256,32 +360,133 @@ fn configureOptimizations(step: *std.Build.Step.Compile, optimize: std.builtin.O
     }
 }
 
-/// Configure BLAS linking for the given compile step based on target platform
-fn configureBlas(step: *std.Build.Step.Compile, target: std.Build.ResolvedTarget) void {
-    const target_os = target.result.os.tag;
+/// Add training commands for different model sizes
+fn addTrainingCommands(b: *std.Build, train_exe: *std.Build.Step.Compile) void {
+    // Test model - ultra fast for testing (< 1 minute)
+    const train_test_cmd = b.addRunArtifact(train_exe);
+    train_test_cmd.step.dependOn(b.getInstallStep());
+    train_test_cmd.addArgs(&[_][]const u8{ "--model-size", "test", "--max-samples", "200", "--epochs", "2" });
 
-    // Link libc for all targets since BLAS requires it
-    step.linkLibC();
+    const train_test_step = b.step("train-test", "🧪 Train tiny test model (200 samples, <1min)");
+    train_test_step.dependOn(&train_test_cmd.step);
 
-    switch (target_os) {
+    // Small model - quick validation (few minutes)
+    const train_small_cmd = b.addRunArtifact(train_exe);
+    train_small_cmd.step.dependOn(b.getInstallStep());
+    train_small_cmd.addArgs(&[_][]const u8{ "--model-size", "small", "--max-samples", "1000", "--epochs", "3" });
+
+    const train_small_step = b.step("train-small", "🏃 Train small model (~5M params, ~5min)");
+    train_small_step.dependOn(&train_small_cmd.step);
+
+    // Conversational model - designed for chat and tool calling (recommended)
+    const train_conversational_cmd = b.addRunArtifact(train_exe);
+    train_conversational_cmd.step.dependOn(b.getInstallStep());
+    train_conversational_cmd.addArgs(&[_][]const u8{ "--model-size", "conversational", "--max-samples", "20000", "--epochs", "8" });
+
+    const train_conversational_step = b.step("train-conversational", "💬 Train conversational AI model (~60M params, chat + tool calling)");
+    train_conversational_step.dependOn(&train_conversational_cmd.step);
+
+    // Medium model - balanced training
+    const train_medium_cmd = b.addRunArtifact(train_exe);
+    train_medium_cmd.step.dependOn(b.getInstallStep());
+    train_medium_cmd.addArgs(&[_][]const u8{ "--model-size", "medium", "--max-samples", "10000", "--epochs", "3" });
+
+    const train_medium_step = b.step("train-medium", "⚡ Train medium model (~50M params, ~25min)");
+    train_medium_step.dependOn(&train_medium_cmd.step);
+
+    // Large model - production quality (longer training)
+    const train_large_cmd = b.addRunArtifact(train_exe);
+    train_large_cmd.step.dependOn(b.getInstallStep());
+    train_large_cmd.addArgs(&[_][]const u8{ "--model-size", "large", "--max-samples", "20000", "--epochs", "5" });
+
+    const train_large_step = b.step("train-large", "🚀 Train large model (~125M params, hours)");
+    train_large_step.dependOn(&train_large_cmd.step);
+
+    // Add LoRA variants for parameter-efficient training
+    const train_small_lora_cmd = b.addRunArtifact(train_exe);
+    train_small_lora_cmd.step.dependOn(b.getInstallStep());
+    train_small_lora_cmd.addArgs(&[_][]const u8{ "--model-size", "small", "--use-lora", "--lora-rank", "16", "--epochs", "5" });
+
+    const train_small_lora_step = b.step("train-small-lora", "🔧 Train small model with LoRA (parameter efficient)");
+    train_small_lora_step.dependOn(&train_small_lora_cmd.step);
+
+    const train_medium_lora_cmd = b.addRunArtifact(train_exe);
+    train_medium_lora_cmd.step.dependOn(b.getInstallStep());
+    train_medium_lora_cmd.addArgs(&[_][]const u8{ "--model-size", "medium", "--use-lora", "--lora-rank", "32", "--epochs", "5" });
+
+    const train_medium_lora_step = b.step("train-medium-lora", "🔧 Train medium model with LoRA (parameter efficient)");
+    train_medium_lora_step.dependOn(&train_medium_lora_cmd.step);
+}
+
+/// Configure BLAS linking (CUDA cuBLAS prioritized, then OpenBLAS, Accelerate, Intel MKL, etc.)
+fn configureBlas(exe: *std.Build.Step.Compile, target: std.Build.ResolvedTarget) void {
+    switch (target.result.os.tag) {
         .macos => {
-            // Use Apple's Accelerate framework
-            step.linkFramework("Accelerate");
-            step.root_module.addCMacro("HAVE_ACCELERATE", "1");
+            // Use Accelerate framework on macOS
+            exe.linkFramework("Accelerate");
         },
-        .linux => {
-            // Use OpenBLAS on Linux
-            step.linkSystemLibrary("openblas");
-            step.root_module.addCMacro("HAVE_OPENBLAS", "1");
-        },
-        .windows => {
-            // Use OpenBLAS on Windows (if available)
-            step.linkSystemLibrary("openblas");
-            step.root_module.addCMacro("HAVE_OPENBLAS", "1");
+        .linux, .windows => {
+            exe.linkLibC();
+
+            // CUDA Detection and Linking (auto-detect CUDA availability)
+            const cuda_available = detectCuda();
+            if (cuda_available) {
+                std.log.info("🎮 CUDA detected - enabling GPU acceleration!", .{});
+
+                // Link CUDA libraries for GPU acceleration
+                exe.linkSystemLibrary("cudart");
+                exe.linkSystemLibrary("cublas");
+                exe.linkSystemLibrary("cublasLt");
+
+                // Add CUDA include paths
+                exe.addIncludePath(.{ .cwd_relative = "/usr/include" });
+                exe.addLibraryPath(.{ .cwd_relative = "/usr/lib/x86_64-linux-gnu" });
+
+                // Enable CUDA compilation
+                exe.root_module.addCMacro("CUDA_ENABLED", "1");
+                exe.root_module.addCMacro("GPU_ACCELERATION", "1");
+
+                std.log.info("✅ CUDA libraries linked successfully", .{});
+            } else {
+                std.log.info("⚠️ CUDA not available - using CPU-only mode", .{});
+                exe.root_module.addCMacro("CUDA_COMPILATION_DISABLED", "1");
+                exe.root_module.addCMacro("CPU_ONLY_MODE", "1");
+            }
+
+            // Always add OpenBLAS as fallback for CPU operations
+            exe.addLibraryPath(.{ .cwd_relative = "/usr/lib/x86_64-linux-gnu/openblas-pthread" });
+            exe.addIncludePath(.{ .cwd_relative = "/usr/include/x86_64-linux-gnu/openblas-pthread" });
+            exe.linkSystemLibrary("openblas");
         },
         else => {
-            // Fallback to naive implementation
-            step.root_module.addCMacro("HAVE_NAIVE_BLAS", "1");
+            // Use CBLAS fallback for other platforms
+            exe.linkSystemLibrary("cblas");
+            exe.linkLibC();
         },
     }
+}
+
+/// Detect if CUDA is available on the system
+fn detectCuda() bool {
+    // Check for CUDA compiler
+    const nvcc_result = std.process.Child.run(.{
+        .allocator = std.heap.page_allocator,
+        .argv = &[_][]const u8{ "which", "nvcc" },
+    }) catch return false;
+    defer std.heap.page_allocator.free(nvcc_result.stdout);
+    defer std.heap.page_allocator.free(nvcc_result.stderr);
+
+    if (nvcc_result.term.Exited != 0) {
+        return false;
+    }
+
+    // Check for cuBLAS library
+    const cublas_check = std.fs.cwd().access("/usr/lib/x86_64-linux-gnu/libcublas.so", .{}) catch return false;
+    _ = cublas_check;
+
+    // Check for CUDA runtime library
+    const cudart_check = std.fs.cwd().access("/usr/lib/x86_64-linux-gnu/libcudart.so", .{}) catch return false;
+    _ = cudart_check;
+
+    return true;
 }

@@ -62,6 +62,7 @@ const BenchmarkResults = struct {
             .accelerate => self.blas_backend = "Apple Accelerate",
             .intel_mkl => self.blas_backend = "Intel MKL",
             .openblas => self.blas_backend = "OpenBLAS",
+            .cuda => self.blas_backend = "CUDA (cuBLAS)",
         }
     }
 };
@@ -195,7 +196,7 @@ fn benchmarkMatrixMultiplicationOptimized(allocator: std.mem.Allocator, size: u3
     // Performance comparison
     const efficiency = gflops / blas_context.performance_info.peak_gflops * 100.0;
     logInfo("  ✅ BLAS-accelerated: {d:.1} ms/iter, {d:.1} GFLOPS ({d:.1}% efficiency)", .{ avg_time_ms, gflops, efficiency });
-    logInfo("  🔧 Backend: {}, Peak: {d:.1} GFLOPS", .{ blas_context.backend, blas_context.performance_info.peak_gflops });
+            logInfo("  🔧 Backend: {any}, Peak: {d:.1} GFLOPS", .{ blas_context.backend, blas_context.performance_info.peak_gflops });
 
     try results.matrix_results.append(MatrixResult{
         .size = size,

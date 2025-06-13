@@ -29,50 +29,11 @@ pub const Tokenizer = tokenizer.Tokenizer;
 pub const Transformer = @import("transformer.zig").Transformer;
 
 // Generation pipeline
-pub const Generation = struct {
-    model: *Model,
-    tokenizer: *Tokenizer,
-
-    const Self = @This();
-
-    pub fn init(model: *Model, tokenizer_instance: *Tokenizer) Self {
-        return Self{
-            .model = model,
-            .tokenizer = tokenizer_instance,
-        };
-    }
-
-    /// Generate text using greedy decoding
-    pub fn generate(
-        self: *Self,
-        prompt: []const u8,
-        max_new_tokens: u32,
-        temperature: f32,
-        top_k: u32,
-    ) ![]u8 {
-        std.log.info("🎯 Generating text for prompt: '{s}'", .{prompt});
-
-        // Tokenize prompt
-        const input_tokens = try self.tokenizer.encodeWithSpecialTokens(prompt, true, false);
-        defer self.tokenizer.allocator.free(input_tokens);
-
-        std.log.debug("📝 Prompt tokens: {any}", .{input_tokens});
-
-        // TODO: Run model inference
-        // For now, return a placeholder response
-        _ = temperature;
-        _ = top_k;
-        _ = max_new_tokens;
-
-        const response = "This is a placeholder response from DeepZig V3! Model inference pipeline coming soon.";
-        return try self.tokenizer.allocator.dupe(u8, response);
-    }
-
-    /// Simple greedy decoding (deterministic)
-    pub fn generateGreedy(self: *Self, prompt: []const u8, max_new_tokens: u32) ![]u8 {
-        return try self.generate(prompt, max_new_tokens, 0.0, 1);
-    }
-};
+// Generation is now in its own module following Zig best practices
+pub const generation = @import("generation.zig");
+pub const Generation = generation.Generation;
+pub const GenerationConfig = generation.GenerationConfig;
+pub const ChatMessage = generation.ChatMessage;
 
 // Core tensor and math components
 // Tensor type aliases for convenience

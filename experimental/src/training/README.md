@@ -6,7 +6,7 @@ This directory contains a pure Zig 0.15.0-dev implementation of the training pip
 
 The training implementation is divided into several components:
 
-- **train_medium.zig**: Main training entry point and implementation for medium-sized model
+- **train.zig**: Main training entry point and implementation for medium-sized model
 - **optimizer.zig**: Implementations of Adam and SGD optimizers for parameter updates
 - **dataset.zig**: Dataset handling, batching, and tokenization utilities
 
@@ -16,7 +16,7 @@ To train the model using the native Zig implementation:
 
 ```bash
 cd /path/to/DeepZig
-zig build train-medium
+zig build train-model
 ```
 
 This will compile and run the training pipeline with default parameters.
@@ -32,7 +32,7 @@ Training configuration options include:
 - Output directory
 - Maximum number of samples
 
-These can be modified directly in the `TrainingConfig` struct in `train_medium.zig`.
+These can be modified directly in the `TrainingConfig` struct in `train.zig`.
 
 ## Benefits of Zig Training
 

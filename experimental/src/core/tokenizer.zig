@@ -69,10 +69,10 @@ pub const Tokenizer = struct {
             .vocab_size = vocab_size,
             .token_to_id = token_to_id,
             .id_to_token = id_to_token,
-            .bos_token_id = 100000,
-            .eos_token_id = 100001,
-            .unk_token_id = 100002,
-            .pad_token_id = null,
+            .bos_token_id = 1,    // Fixed: Use standard BOS token ID
+            .eos_token_id = 2,    // Fixed: Use standard EOS token ID
+            .unk_token_id = 0,    // Fixed: Use standard UNK token ID
+            .pad_token_id = 3,    // Fixed: Use standard PAD token ID
             .merge_rules = merge_rules,
         };
     }
@@ -174,27 +174,81 @@ pub const Tokenizer = struct {
         id_to_token: *std.HashMap(u32, []const u8, std.hash_map.AutoContext(u32), std.hash_map.default_max_load_percentage),
         allocator: Allocator,
     ) !void {
-        // Add single-byte tokens for all possible bytes
-        for (0..256) |i| {
-            const byte_val = @as(u8, @intCast(i));
-            const token = try allocator.alloc(u8, 1);
-            token[0] = byte_val;
+        // FIXED: Start with special tokens at low IDs
+        var id: u32 = 0;
 
-            const id = @as(u32, @intCast(i));
-            try token_to_id.put(token, id);
-            try id_to_token.put(id, token);
+        // Special tokens first
+        const special_tokens = [_][]const u8{ "<unk>", "<s>", "</s>", "<pad>" };
+        for (special_tokens) |token| {
+            const token_copy = try allocator.dupe(u8, token);
+            try token_to_id.put(token_copy, id);
+            try id_to_token.put(id, token_copy);
+            id += 1;
         }
 
-        // Add common tokens for better tokenization
-        const common_tokens = [_][]const u8{
-            " ", "  ", "   ", "    ", // Spaces
-            "\n", "\r\n", "\t", // Whitespace
-            "the", "and", "or", "a", "an", "is", "are", "was", "were", // Common words
-            "ing", "ed", "er", "ly", "s", "'s", "'t", "'re", "'ve", "'ll", // Common suffixes
+        // Common words and characters that the model is likely to generate
+        const common_vocab = [_][]const u8{
+            // Common single characters
+            " ", "!", "?", ".", ",", ":", ";",
+            "a", "e", "i", "o", "u", "n", "t", "r", "s", "l", "h", "d", "c", "m", "f", "p", "g", "w", "y", "b", "v", "k", "x", "j", "q", "z",
+            "A", "E", "I", "O", "U", "N", "T", "R", "S", "L", "H", "D", "C", "M", "F", "P", "G", "W", "Y", "B", "V", "K", "X", "J", "Q", "Z",
+            "0", "1", "2", "3", "4", "5", "6", "7", "8", "9",
+
+            // Common words
+            "the", "and", "or", "a", "an", "is", "are", "was", "were", "I", "you", "he", "she", "it", "we", "they",
+            "this", "that", "with", "for", "on", "in", "at", "to", "of", "as", "by", "be", "do", "have", "can", "will",
+            "Hello", "Hi", "How", "What", "Why", "When", "Where", "Who", "Please", "Thank", "help", "Yes", "No",
+
+            // Common endings
+            "ing", "ed", "er", "ly", "s", "'s", "'t", "'re", "'ve", "'ll", "'d",
+
+            // Programming/technical
+            "function", "def", "class", "import", "return", "if", "else", "for", "while", "try", "except",
+            "python", "code", "data", "model", "train", "test", "example", "result",
         };
 
-        var id: u32 = 256;
-        for (common_tokens) |token| {
+        for (common_vocab) |token| {
+            const token_copy = try allocator.dupe(u8, token);
+            try token_to_id.put(token_copy, id);
+            try id_to_token.put(id, token_copy);
+            id += 1;
+        }
+
+        // Add printable ASCII for remaining slots
+        for (32..127) |i| {
+            const byte_val = @as(u8, @intCast(i));
+            const char_str = [_]u8{byte_val};
+
+            // Check if we already added this character
+            if (!token_to_id.contains(&char_str)) {
+                const token = try allocator.alloc(u8, 1);
+                token[0] = byte_val;
+                try token_to_id.put(token, id);
+                try id_to_token.put(id, token);
+                id += 1;
+            }
+        }
+
+        // Add conversational tokens for chat applications
+        const conversation_tokens = [_][]const u8{
+            // Chat role markers
+            "<user>", "</user>", // User messages
+            "<assistant>", "</assistant>", // Assistant responses
+            "<system>", "</system>", // System prompts
+
+            // Tool calling tokens
+            "<tool>", "</tool>", // Tool calls
+            "<function>", "</function>", // Function definitions
+            "<result>", "</result>", // Tool results
+            "{", "}", "[", "]", // JSON formatting
+            "\"", ":", // JSON syntax (comma already added above)
+
+            // Additional common patterns
+            "Can", "Could", "Would", "me", "my", "your", "our", "their",
+        };
+
+        // Add conversation tokens
+        for (conversation_tokens) |token| {
             const token_copy = try allocator.dupe(u8, token);
             try token_to_id.put(token_copy, id);
             try id_to_token.put(id, token_copy);
@@ -310,10 +364,32 @@ pub const Tokenizer = struct {
             }
 
             if (self.id_to_token.get(token_id)) |token| {
-                try result.appendSlice(token);
+                // Validate UTF-8 before adding
+                if (std.unicode.utf8ValidateSlice(token)) {
+                    try result.appendSlice(token);
+                } else {
+                    // Invalid UTF-8 - convert byte to readable form
+                    if (token.len == 1 and token[0] >= 32 and token[0] <= 126) {
+                        // Printable ASCII
+                        try result.appendSlice(token);
+                    } else {
+                        // Non-printable or invalid - add safe replacement
+                        try result.append('?');
+                    }
+                }
             } else {
-                // Unknown token - add replacement character
-                try result.appendSlice("");
+                // Unknown token - check if it's a valid single byte
+                if (token_id < 256) {
+                    const byte_val = @as(u8, @intCast(token_id));
+                    if (byte_val >= 32 and byte_val <= 126) {
+                        try result.append(byte_val);
+                    } else {
+                        try result.append('?');
+                    }
+                } else {
+                    // Completely unknown token - use readable replacement
+                    try result.appendSlice("<UNK>");
+                }
             }
         }
 
