@@ -27,6 +27,9 @@ pub const DataLoaderConfig = struct {
 };
 
 /// Training batch containing tokenized sequences
+/// 
+/// IMPORTANT: When a batch is returned from DataLoader.nextBatch(),
+/// the caller takes ownership and MUST call batch.deinit() when done.
 pub const Batch = struct {
     allocator: Allocator,
     input_ids: [][]u32,
@@ -154,11 +157,16 @@ pub const DataLoader = struct {
     }
 
     pub fn deinit(self: *DataLoader) void {
-        // Stop workers
+        // Stop workers and ensure all allocated batches are properly freed
         for (self.workers) |*worker| {
             worker.should_stop = true;
             worker.thread.join();
             worker.samples.deinit();
+            
+            // Free any batches in the worker's queue
+            for (worker.batch_queue.items) |*batch| {
+                batch.deinit(); // Explicitly call deinit on each batch
+            }
             worker.batch_queue.deinit();
         }
         self.allocator.free(self.workers);

@@ -39,7 +39,7 @@ This implementation leverages Zig's unique advantages for systems programming to
 - **🆕 HuggingFace Compatibility** - Load models directly from HuggingFace format
 - **🆕 Theoretically Solid Tokenization** - Full BPE implementation with special token support
 - **🆕 Base Configuration** - Comprehensive model configuration draft with validation
-- **🆕 Multiple Model Sizes** - Support for tiny, small, and medium model configurations (initial draft)
+- **🆕 Multiple Model Sizes** - Support for test, small, medium, and large model configurations with command-line selection
 
 **🚀 BLAS Acceleration Achieved!** We've successfully integrated Apple Accelerate backend delivering **1000+ GFLOPS** performance - a **3000x speedup** over the initial naive implementation. Measured on an M1 Macbook.
 
@@ -351,6 +351,35 @@ zig build run -- --model-dir ./deepseek-v3-7b --prompt "Hello, world!"
 # Format code
 zig fmt src/
 ```
+
+## Training with Different Model Sizes
+
+The training setup now supports multiple model sizes for scalable experimentation, closely matching the Python reference implementation. This allows for quick validation runs and gradually scaling up to larger models:
+
+```bash
+# Ultra-fast test run (< 1M params)
+zig build train-medium -- --model-size test
+
+# Quick training run (~5M params)
+zig build train-medium -- --model-size small
+
+# Default training run (~50M params)
+zig build train-medium
+
+# High-quality training run (~125M params)
+zig build train-medium -- --model-size large
+```
+
+### Model Size Specifications
+
+| Size   | Parameters | Hidden Size | Layers | Heads | Description               |
+|--------|------------|-------------|--------|-------|---------------------------|
+| test   | < 1M       | 128         | 2      | 4     | Ultra-fast validation     |
+| small  | ~5M        | 512         | 4      | 8     | Quick experimentation     |
+| medium | ~50M       | 2048        | 24     | 32    | Default training setup    |
+| large  | ~125M      | 3072        | 32     | 48    | High-quality (GPT-2 scale)|
+
+Each model configuration automatically adjusts batch size and other training parameters for optimal performance on the available hardware.
 
 ## Performance Notes
 

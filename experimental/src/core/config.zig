@@ -171,7 +171,8 @@ pub const ModelConfig = struct {
         return config;
     }
 
-    /// Get default DeepSeek V3 configuration (full model)
+    /// Get default DeepSeek V3 configuration (full model - 70B params)
+    /// This is the complete configuration for DeepSeek-V3-70B
     pub fn defaultDeepSeekV3() ModelConfig {
         return ModelConfig{};
     }
@@ -202,29 +203,68 @@ pub const ModelConfig = struct {
         };
     }
 
-    /// Get small test configuration for testing
-    pub fn smallTest() ModelConfig {
-        return ModelConfig{
-            .vocab_size = 10000,
+    /// Create test configuration (< 1M params) for ultra-fast validation
+    /// Perfect for quick tests and debugging, as it uses minimal resources.
+    /// Matches Python "test" config for rapid experimentation.
+    ///
+    /// Returns: Allocated config that must be freed with deinit()
+    /// Memory: ~500KB model size when loaded
+    pub fn testConfig(allocator: Allocator) !*ModelConfig {
+        const config = try allocator.create(ModelConfig);
+        config.* = ModelConfig{
+            .vocab_size = 2000,
+            .hidden_size = 128,
+            .intermediate_size = 256,
+            .num_hidden_layers = 2,
+            .num_attention_heads = 4,
+            .num_key_value_heads = 4,
+            .max_position_embeddings = 512,
+            .qk_nope_head_dim = 16,
+            .qk_rope_head_dim = 16,
+            .v_head_dim = 32,
+            .num_experts = 1,
+            .num_experts_per_token = 1,
+            .moe_layer_freq = 1,
+            .first_k_dense_replace = 0,
+            .moe_intermediate_size = 256,
+        };
+        return config;
+    }
+    
+    /// Create small config (~5M params) for quick experimentation
+    /// Suitable for frequent iterations and baseline testing.
+    /// Matches Python "small" config for efficient development.
+    ///
+    /// Returns: Allocated config that must be freed with deinit()
+    /// Memory: ~20MB model size when loaded
+    pub fn smallConfig(allocator: Allocator) !*ModelConfig {
+        const config = try allocator.create(ModelConfig);
+        config.* = ModelConfig{
+            .vocab_size = 8000,
             .hidden_size = 512,
             .intermediate_size = 1024,
             .num_hidden_layers = 4,
             .num_attention_heads = 8,
             .num_key_value_heads = 8,
             .max_position_embeddings = 2048,
-            .qk_nope_head_dim = 64,
+            .qk_nope_head_dim = 32,
             .qk_rope_head_dim = 32,
             .v_head_dim = 64,
-            .num_experts = 8,
+            .num_experts = 2,
             .num_experts_per_token = 2,
             .moe_layer_freq = 2,
             .first_k_dense_replace = 1,
             .moe_intermediate_size = 512,
         };
+        return config;
     }
 
-    /// Configuration for the medium-sized model
-    /// Returns a heap-allocated config that must be freed with deinit()
+    /// Create medium config (~50M params) for standard training
+    /// This is the default configuration for most training runs.
+    /// Good balance of quality and performance, comparable to small commercial models.
+    ///
+    /// Returns: Allocated config that must be freed with deinit()
+    /// Memory: ~200MB model size when loaded
     pub fn mediumConfig(allocator: Allocator) !*ModelConfig {
         const config = try allocator.create(ModelConfig);
         config.* = ModelConfig{
@@ -243,6 +283,34 @@ pub const ModelConfig = struct {
             .moe_layer_freq = 2,
             .first_k_dense_replace = 2,
             .moe_intermediate_size = 4096,
+        };
+        return config;
+    }
+    
+    /// Create large config (~125M params, GPT-2 Small equivalent)
+    /// For high-quality outputs requiring more compute resources.
+    /// Capable of sophisticated reasoning and general task performance.
+    ///
+    /// Returns: Allocated config that must be freed with deinit()
+    /// Memory: ~500MB model size when loaded
+    pub fn largeConfig(allocator: Allocator) !*ModelConfig {
+        const config = try allocator.create(ModelConfig);
+        config.* = ModelConfig{
+            .vocab_size = 32000,
+            .hidden_size = 3072,
+            .intermediate_size = 8192,
+            .num_hidden_layers = 32,
+            .num_attention_heads = 48,
+            .num_key_value_heads = 48,
+            .max_position_embeddings = 8192,
+            .qk_nope_head_dim = 48,
+            .qk_rope_head_dim = 16,
+            .v_head_dim = 64,
+            .num_experts = 32,
+            .num_experts_per_token = 8,
+            .moe_layer_freq = 2,
+            .first_k_dense_replace = 4,
+            .moe_intermediate_size = 6144,
         };
         return config;
     }

@@ -34,8 +34,19 @@ const getOptimalConfig = training.getOptimalConfig;
 const HardwareInfo = training.HardwareInfo;
 const initCudaBackend = training.initCudaBackend;
 
+// ModelSizeType is a simple string type for compatibility with Zig 0.15.0-dev
+pub const ModelSizeType = []const u8;
+// Predefined model size options
+pub const MODEL_SIZE_TEST = "test";
+pub const MODEL_SIZE_SMALL = "small";
+pub const MODEL_SIZE_MEDIUM = "medium";
+pub const MODEL_SIZE_LARGE = "large";
+
 /// Hardware-optimized training configuration
 pub const TrainingConfig = struct {
+    // Model configuration
+    model_size: ModelSizeType = MODEL_SIZE_MEDIUM,
+    
     // Training parameters (optimized for RTX 2070 SUPER 8GB VRAM)
     batch_size: u32 = 64,        // Larger batches for better GPU utilization
     micro_batch_size: u32 = 16,  // Increased for Tensor Core efficiency
@@ -60,6 +71,12 @@ pub const TrainingConfig = struct {
     dataloader_workers: u32 = 20,  // Use most of 24 CPU threads
     prefetch_batches: u32 = 8,     // More prefetching with abundant memory
     pin_memory: bool = true,       // Enable for faster GPU transfers
+    
+    // Model size documentation
+    // test:   Ultra-fast test (<1M params)
+    // small:  Fast training (~5M params)
+    // medium: Default size (~50M params)
+    // large:  High quality (~125M params)
 
     // Hardware acceleration
     use_cuda: bool = false,        // Will be auto-detected
@@ -442,6 +459,86 @@ pub const LearningRateScheduler = struct {
     }
 };
 
+/// Parse command line arguments
+pub fn parseArgs(allocator: Allocator) !TrainingConfig {
+    const args = try std.process.argsAlloc(allocator);
+    defer std.process.argsFree(allocator, args);
+    
+    var config = TrainingConfig{};
+    
+    // Process args (starting from index 1 to skip executable name)
+    var i: usize = 1;
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
+        
+        if (std.mem.eql(u8, arg, "--model-size") or std.mem.eql(u8, arg, "-m")) {
+            i += 1;
+            if (i >= args.len) return error.MissingValue;
+            
+            const size_str = args[i];
+            if (std.mem.eql(u8, size_str, "test")) {
+                config.model_size = MODEL_SIZE_TEST;
+                // Adjust batch size for tiny model
+                config.batch_size = 16;
+                config.micro_batch_size = 8;
+                config.num_epochs = 2;
+            } else if (std.mem.eql(u8, size_str, "small")) {
+                config.model_size = MODEL_SIZE_SMALL;
+                config.batch_size = 32;
+                config.micro_batch_size = 8;
+            } else if (std.mem.eql(u8, size_str, "medium")) {
+                config.model_size = MODEL_SIZE_MEDIUM;
+            } else if (std.mem.eql(u8, size_str, "large")) {
+                config.model_size = MODEL_SIZE_LARGE;
+                config.batch_size = 32; // Reduce batch size for larger model
+            } else {
+                log.err("Invalid model size: {s}", .{size_str});
+                return error.InvalidValue;
+            }
+        } else if (std.mem.eql(u8, arg, "--batch-size") or std.mem.eql(u8, arg, "-b")) {
+            i += 1;
+            if (i >= args.len) return error.MissingValue;
+            config.batch_size = try std.fmt.parseInt(u32, args[i], 10);
+        } else if (std.mem.eql(u8, arg, "--epochs") or std.mem.eql(u8, arg, "-e")) {
+            i += 1;
+            if (i >= args.len) return error.MissingValue;
+            config.num_epochs = try std.fmt.parseInt(u32, args[i], 10);
+        } else if (std.mem.eql(u8, arg, "--max-samples") or std.mem.eql(u8, arg, "-s")) {
+            i += 1;
+            if (i >= args.len) return error.MissingValue;
+            config.max_samples = try std.fmt.parseInt(u32, args[i], 10);
+        } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
+            printHelp();
+            std.process.exit(0);
+        }
+    }
+    
+    return config;
+}
+
+/// Print help information
+fn printHelp() void {
+    std.io.getStdOut().writer().print(
+        \\DeepZig V3 Training
+        \\=====================================
+        \\Usage: train-medium [options]
+        \\
+        \\Options:
+        \\  --model-size, -m <size>   Model size: test, small, medium, large (default: medium)
+        \\  --batch-size, -b <n>      Batch size (adjusted automatically per model size)
+        \\  --epochs, -e <n>          Number of training epochs
+        \\  --max-samples, -s <n>     Maximum number of training samples
+        \\  --help, -h               Show this help message
+        \\
+        \\Examples:
+        \\  train-medium --model-size test   Ultra-fast test run (<1M params)
+        \\  train-medium --model-size small  Quick training run (~5M params)
+        \\  train-medium                     Default training (~50M params)
+        \\  train-medium --model-size large  Full quality (~125M params)
+        \\=====================================
+, .{}) catch {};
+}
+
 /// Main entry point for training
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -449,6 +546,13 @@ pub fn main() !void {
     const allocator = gpa.allocator();
 
     log.info("=== DeepZig V3 High-Performance Training ===", .{});
+    
+    // Parse command line arguments
+    var config = parseArgs(allocator) catch |err| {
+        log.err("Error parsing arguments: {}", .{err});
+        printHelp();
+        return err;
+    };
 
     // Detect and display system information
     const hardware: ?HardwareInfo = detectHardware(allocator) catch |err| {
@@ -472,19 +576,8 @@ pub fn main() !void {
         }
     }
 
-    // Initialize hardware-optimized training configuration
-    var config = TrainingConfig{
-        .batch_size = 64,           // Optimized for RTX 2070 SUPER
-        .micro_batch_size = 16,     // Tensor Core friendly
-        .use_mixed_precision = true,
-        .use_tensor_cores = true,
-        .num_epochs = 3,
-        .dataloader_workers = 20,   // Use most of 24 threads
-        .optimizer_threads = 20,
-        .prefetch_batches = 8,      // More aggressive prefetching
-        .pin_memory = true,
-        .hardware = hardware,
-    };
+    // Apply hardware-specific optimizations to parsed config
+    config.hardware = hardware;
 
     // Enable CUDA if detected
     if (hardware) |hw| {
@@ -506,8 +599,24 @@ pub fn main() !void {
         }
     }
 
-    // Initialize model
-    var model_config = try deepseek.config.ModelConfig.mediumConfig(allocator);
+    // Initialize model based on selected size
+    log.info("Initializing model size: {s}", .{config.model_size});
+    
+    var model_config: *deepseek.config.ModelConfig = undefined;
+    
+    if (std.mem.eql(u8, config.model_size, MODEL_SIZE_TEST)) {
+        model_config = try deepseek.config.ModelConfig.testConfig(allocator);
+    } else if (std.mem.eql(u8, config.model_size, MODEL_SIZE_SMALL)) {
+        model_config = try deepseek.config.ModelConfig.smallConfig(allocator);
+    } else if (std.mem.eql(u8, config.model_size, MODEL_SIZE_MEDIUM)) {
+        model_config = try deepseek.config.ModelConfig.mediumConfig(allocator);
+    } else if (std.mem.eql(u8, config.model_size, MODEL_SIZE_LARGE)) {
+        model_config = try deepseek.config.ModelConfig.largeConfig(allocator);
+    } else {
+        // Fall back to medium as default
+        log.warn("Unknown model size: {s}, using medium", .{config.model_size});
+        model_config = try deepseek.config.ModelConfig.mediumConfig(allocator);
+    }
     defer model_config.deinit();
 
     var model = try deepseek.Model.initFromConfig(allocator, model_config);
@@ -518,7 +627,8 @@ pub fn main() !void {
     defer trainer.deinit();
 
     // Show final configuration
-    log.info("Final config: batch={d}, workers={d}, CUDA={}, SIMD={}", .{
+    log.info("Final config: size={s}, batch={d}, workers={d}, CUDA={}, SIMD={}", .{
+        trainer.config.model_size,
         trainer.config.batch_size,
         trainer.config.dataloader_workers,
         trainer.config.use_cuda,

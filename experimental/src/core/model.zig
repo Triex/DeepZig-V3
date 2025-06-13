@@ -532,9 +532,10 @@ pub const Model = struct {
 
     /// Load small test model (4 layers, medium dims)
     pub fn loadSmall(allocator: Allocator, backend: Backend) !Self {
-        const config = ModelConfig.smallTest();
-        const tokenizer = try Tokenizer.init(allocator, config.vocab_size);
-        return try Self.loadDefaultWithConfig(allocator, config, tokenizer, backend);
+        const config_ptr = try ModelConfig.testConfig(allocator);
+        defer allocator.destroy(config_ptr);
+        const tokenizer = try Tokenizer.init(allocator, config_ptr.vocab_size);
+        return try Self.loadDefaultWithConfig(allocator, config_ptr.*, tokenizer, backend);
     }
 
     /// Free model memory
