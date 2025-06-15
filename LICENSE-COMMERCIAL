@@ -1,50 +1,75 @@
 # DeepZig V3 Commercial License
-
-© 2025 TriexDev
+© 2025 TriexDev  
 
 ## Commercial License Agreement
-
-This is a proprietary software license that permits use of DeepZig V3
-in commercial and proprietary applications.
-
-### Commercial License Benefits:
-- ✅ Use in proprietary/closed-source products
-- ✅ No GPL-3.0 copyleft obligations  
-- ✅ Distribute without source code disclosure
-- ✅ Warranty and support options available
-- ✅ Indemnification protection
-- ✅ Priority technical support
-
-### License Grant:
-Subject to the terms and payment of applicable license fees, TriexDev
-grants you a non-exclusive, non-transferable license to use, modify,
-and distribute DeepZig V3 in your commercial products.
-
-### What's Included:
-- Complete DeepZig V3 source code
-- Multi-Head Latent Attention implementation
-- BLAS-accelerated tensor operations
-- Cross-platform build system
-- Commercial use rights
-
-### Contact for Commercial Licensing:
-- **GitHub**: [@Triex](https://github.com/Triex)
-- **Email**: hi@triex.dev
-- **Enterprise Support**: Available upon request
-
-### Pricing:
-Commercial license fees vary based on:
-- Team size and usage scale
-- Support level required
-- Deployment scope
-- Custom development needs
-
-Contact us for a quote tailored to your needs.
+This is a proprietary software license allowing the use of DeepZig V3 in commercial and proprietary applications, with assurances to meet enterprise needs and support scalable deployment.
 
 ---
 
-**Note**: If you're using DeepZig V3 under the GPL-3.0 license,
-you don't need this commercial license unless you want to:
-- Use in proprietary software
-- Avoid GPL-3.0 copyleft requirements
-- Get commercial support/warranty
+### Exclusive Benefits of the Commercial License:
+- ✅ Full use in proprietary/closed-source products.
+- ✅ Freedom from GPL-3.0 copyleft obligations.
+- ✅ Distribute without source code disclosure requirements.
+- ✅ Access to priority enterprise-level technical support.
+- ✅ Warranty and indemnification protection against liability.
+- ✅ Tailored solutions to meet unique commercial requirements.
+
+---
+
+### License Grant:
+Upon agreeing to this license and payment of applicable license fees, Triex grants the Licensee:  
+1. **Non-exclusive, non-transferable rights** to use, modify, and integrate DeepZig V3 into proprietary applications.
+2. Rights to **redistribute compiled versions** of DeepZig V3-based software without disclosing source code, as explicitly allowed under the commercial license.
+
+---
+
+### What's Included:
+- Complete DeepZig V3 source code (proprietary distribution rights).
+- Multi-Head Latent Attention (MLA) implementation for optimized AI inference.
+- BLAS-accelerated tensor operations for high-performance scalability.
+- Cross-platform build system suited for cloud, on-premises, and edge deployment scenarios.
+- Guaranteed warranty options for production-grade reliability.
+
+---
+
+### Contact for Commercial Licensing  
+- **GitHub**: [@Triex](https://github.com/Triex)  
+- **Email**: hi@triex.dev  
+- **Enterprise Support**: Tailored service is available upon request.
+
+---
+
+### Pricing Information  
+License fees are structured based on usage and organizational factors like:
+- **Team Size**: Single developer, small teams, to large enterprises.
+- **Deployment Scale**: Cloud instances, on-premises usage, or SaaS integrations.
+- **Support Needs**: Basic assistance to 24/7 SLA-managed support.
+- **Custom Integration**: Tailored features or extended performance enhancements.
+
+Contact TriexDev for a customized quote.
+
+---
+
+### Note Regarding GPL-3.0 License Use
+If using DeepZig V3 under the open-source GPL-3.0 license:
+- You do not need this commercial license unless you plan to:
+  1. Integrate into proprietary or non-GPL-compliant projects.
+  2. Avoid disclosing source code under the copyleft obligations of GPL-3.0.
+  3. Require enterprise-level support, warranties, or indemnification guarantees.
+
+---
+
+### Ethical and Responsible Use
+Triex supports the ethical and responsible deployment of AI technologies. The Licensee agrees not to use DeepZig V3 or derivative works for:
+- **Misinformation or disinformation campaigns**.
+- **Projects that intentionally breach privacy or personal data rights**.
+- **Weapons manufacturing or military-centered use cases**.
+- **Social harm applications, including discriminatory profiling**.  
+
+Triex reserves the right to terminate the agreement if the Licensee is found in violation of these principles.
+
+---
+
+### Additional Details or Queries
+For more information, visit:  
+- [GitHub Repository: DeepZig V3](https://github.com/Triex/DeepZig-V3)
