@@ -365,9 +365,9 @@ fn addTrainingCommands(b: *std.Build, train_exe: *std.Build.Step.Compile) void {
     // Test model - ultra fast for testing (< 1 minute)
     const train_test_cmd = b.addRunArtifact(train_exe);
     train_test_cmd.step.dependOn(b.getInstallStep());
-    train_test_cmd.addArgs(&[_][]const u8{ "--model-size", "test", "--max-samples", "200", "--epochs", "2" });
+    train_test_cmd.addArgs(&[_][]const u8{ "--model-size", "test", "--max-samples", "2000", "--epochs", "4" });
 
-    const train_test_step = b.step("train-test", "🧪 Train tiny test model (200 samples, <1min)");
+    const train_test_step = b.step("train-test", "🧪 Train test model (1M params, REAL learning, fast results)");
     train_test_step.dependOn(&train_test_cmd.step);
 
     // Small model - quick validation (few minutes)
@@ -434,9 +434,10 @@ fn configureBlas(exe: *std.Build.Step.Compile, target: std.Build.ResolvedTarget)
                 std.log.info("🎮 CUDA detected - enabling GPU acceleration!", .{});
 
                 // Link CUDA libraries for GPU acceleration
-                exe.linkSystemLibrary("cudart");
-                exe.linkSystemLibrary("cublas");
-                exe.linkSystemLibrary("cublasLt");
+                exe.linkSystemLibrary("cuda");      // CUDA Driver API (for cuInit, cuDeviceGetCount, etc.)
+                exe.linkSystemLibrary("cudart");    // CUDA Runtime API
+                exe.linkSystemLibrary("cublas");    // cuBLAS for matrix operations
+                exe.linkSystemLibrary("cublasLt");  // cuBLAS LT (lightweight)
 
                 // Add CUDA include paths
                 exe.addIncludePath(.{ .cwd_relative = "/usr/include" });

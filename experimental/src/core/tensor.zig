@@ -299,14 +299,19 @@ pub fn Tensor(comptime dtype: TensorDType) type {
                 switch (DataType) {
                     f32 => {
                         blas_context.matmul(f32, self.data, other.data, result.data, dims);
-                        // Reduced logging to prevent spam - only log large operations
-        if (m * k * n > 100000) {
-            logDebug("✅ BLAS-accelerated f32 matrix multiplication: {}x{} * {}x{}", .{ m, k, k, n });
-        }
+                        // FIXED: Remove debug spam - significantly increased threshold to only log truly massive operations
+                        // Old threshold: 10M elements was too low for model training
+                        // New threshold: 500M elements (50x higher) to drastically reduce debug log spam during training
+                        if (m * k * n > 500_000_000) {
+                            logDebug("🔧 Very large BLAS operation: {}x{} * {}x{} ({d:.1}M ops)", .{ m, k, k, n, @as(f32, @floatFromInt(m * k * n)) / 1_000_000.0 });
+                        }
                     },
                     f64 => {
                         blas_context.matmul(f64, self.data, other.data, result.data, dims);
-                        logDebug("✅ BLAS-accelerated f64 matrix multiplication: {}x{} * {}x{}", .{ m, k, k, n });
+                        // FIXED: Same for f64 - no spam logging
+                        if (m * k * n > 10_000_000) {
+                            logDebug("🔧 Large BLAS f64 operation: {}x{} * {}x{} ({d:.1}M ops)", .{ m, k, k, n, @as(f32, @floatFromInt(m * k * n)) / 1_000_000.0 });
+                        }
                     },
                     else => unreachable, // We already checked for f32/f64 above
                 }

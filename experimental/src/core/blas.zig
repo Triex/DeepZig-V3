@@ -11,9 +11,11 @@
 // - Fallback: Naive implementation (~10 GFLOPS)
 
 const std = @import("std");
+const root = @import("root");
+const builtin = @import("builtin");
+
 const Allocator = std.mem.Allocator;
 const Random = std.Random;
-const builtin = @import("builtin");
 
 // Import our comprehensive hardware detection
 const hardware = @import("hardware.zig");
@@ -21,11 +23,39 @@ const HardwareInfo = hardware.HardwareInfo;
 const BlasConfig = hardware.BlasConfig;
 const BlasBackend = hardware.BlasBackend;
 
+// cuBLAS types
+const cublasStatus_t = c_int;
+pub const cublasHandle_t = *opaque {};
+
+// cuBLAS status codes
+const CUBLAS_STATUS_SUCCESS: cublasStatus_t = 0;
+const CUBLAS_STATUS_NOT_INITIALIZED: cublasStatus_t = 1;
+const CUBLAS_STATUS_ALLOC_FAILED: cublasStatus_t = 2;
+const CUBLAS_STATUS_INVALID_VALUE: cublasStatus_t = 3;
+const CUBLAS_STATUS_ARCH_MISMATCH: cublasStatus_t = 8; // Keep this for backward compatibility
+const CUBLAS_STATUS_MAPPING_ERROR: cublasStatus_t = 7;
+const CUBLAS_STATUS_EXECUTION_FAILED: cublasStatus_t = 8;
+const CUBLAS_STATUS_INTERNAL_ERROR: cublasStatus_t = 9;
+
+// cuBLAS operation types
+const CUBLAS_OP_N: c_int = 0; // non-transpose
+const CUBLAS_OP_T: c_int = 1; // transpose
+const CUBLAS_OP_C: c_int = 2; // conjugate transpose
+
+// CUDA event flags
+const cudaEventDefault: c_uint = 0;
+const cudaEventBlockingSync: c_uint = 1;
+const cudaEventDisableTiming: c_uint = 2;
+const cudaEventInterprocess: c_uint = 4;
+
 // CUDA Backend Implementation
-const CudaBackend = struct {
+pub const CudaBackend = struct {
     allocator: Allocator,
-    device_id: i32,
-    context: ?*anyopaque,
+    context: ?*anyopaque, // CUDA context (CUcontext)
+    cublas_handle: ?cublasHandle_t,
+    stream: ?cudaStream_t,
+    mempool: ?cudaMemPool_t, // Memory pool for efficient allocation
+    event: ?cudaEvent_t,  // CUDA event for synchronization between operations
 
     const Self = @This();
 
@@ -34,36 +64,216 @@ const CudaBackend = struct {
     pub const CudaTranspose = Transpose;
 
     pub fn init(allocator: Allocator) !Self {
-        // Try to initialize CUDA
-        if (cuInit(0) != 0) {
-            return error.CudaNotAvailable;
+        // Try to initialize CUDA with detailed error logging
+        var status: i32 = undefined;
+
+        logInfo("🔍 Attempting CUDA initialization...", .{});
+
+        // Initialize CUDA driver
+        status = cuInit(0);
+        if (status != 0) {
+            logInfo("❌ CUDA driver initialization failed with status code: {}", .{status});
+            return error.CudaDriverInitFailed;
+        }
+        logInfo("✅ CUDA driver initialized successfully", .{});
+
+        // Get device count
+        var device_count: c_int = 0;
+        status = cuDeviceGetCount(&device_count);
+        if (status != 0) {
+            logInfo("❌ Failed to get CUDA device count: status code {}", .{status});
+            return error.CudaNoDevicesFound;
+        }
+        if (device_count == 0) {
+            logInfo("❌ No CUDA devices found", .{});
+            return error.CudaNoDevicesFound;
+        }
+        logInfo("✅ Found {} CUDA device(s)", .{device_count});
+
+        // Get first CUDA device
+        var device: c_int = 0;
+        status = cuDeviceGet(&device, 0);
+        if (status != 0) {
+            logInfo("❌ Failed to get CUDA device 0: status code {}", .{status});
+            return error.CudaDeviceAccessFailed;
         }
 
-        var device_count: i32 = 0;
-        if (cuDeviceGetCount(&device_count) != 0 or device_count == 0) {
-            return error.CudaNotAvailable;
+        // Get device name for logging
+        var device_name_buffer: [256]u8 = undefined;
+        var device_name: []u8 = device_name_buffer[0..];
+        status = cuDeviceGetName(device_name.ptr, @intCast(device_name.len), device);
+        if (status == 0) {
+            // Find null terminator
+            var name_len: usize = 0;
+            while (name_len < device_name.len and device_name[name_len] != 0) : (name_len += 1) {}
+            logInfo("✅ Using CUDA device: {s}", .{device_name[0..name_len]});
+        } else {
+            logInfo("✅ Using CUDA device ID: {} (unable to get name)", .{device});
         }
 
-        var device: i32 = 0;
-        if (cuDeviceGet(&device, 0) != 0) {
-            return error.CudaNotAvailable;
-        }
-
+        // Create CUDA context
         var context: ?*anyopaque = null;
-        if (cuCtxCreate(&context, 0, device) != 0) {
-            return error.CudaNotAvailable;
+        status = cuCtxCreate_v2(&context, 0, device);
+        if (status != 0) {
+            logInfo("❌ Failed to create CUDA context: status code {}", .{status});
+            return error.CudaContextCreationFailed;
         }
+        logInfo("✅ CUDA context created successfully", .{});
+
+        // Set context as current for this thread before initializing cuBLAS
+        logInfo("🔍 Setting CUDA context as current for this thread...", .{});
+        const set_current_result = cuCtxSetCurrent(context);
+        if (set_current_result != 0) {
+            logInfo("❌ Failed to set CUDA context as current, error code: {}", .{set_current_result});
+            _ = cuCtxDestroy_v2(context);
+            return error.CudaContextSetCurrentFailed;
+        }
+        logInfo("✅ CUDA context set as current successfully", .{});
+
+        // Try direct library loading for cuBLAS
+        logInfo("🔍 Attempting to directly detect cuBLAS library...", .{});
+        const lib_names = [_][]const u8{ "/usr/lib/x86_64-linux-gnu/libcublas.so", "/usr/local/cuda/lib64/libcublas.so" };
+
+        var lib_found = false;
+        for (lib_names) |lib_name| {
+            const lib_exists = std.fs.cwd().access(lib_name, .{}) catch |err| {
+                logInfo("ℹ️ cuBLAS library path check: {s} - {}", .{ lib_name, err });
+                continue;
+            };
+            _ = lib_exists;
+            lib_found = true;
+            logInfo("✅ Found cuBLAS library at: {s}", .{lib_name});
+            break;
+        }
+
+        if (!lib_found) {
+            logInfo("❌ Could not find cuBLAS library in standard locations", .{});
+        }
+
+        // Initialize CUDA Runtime API (required before cuBLAS)
+        logInfo("🔍 Initializing CUDA Runtime API with cudaFree(null)...", .{});
+        const runtime_result = cudaFree(null);
+        if (runtime_result != 0) {
+            logInfo("❌ Failed to initialize CUDA Runtime API: error code {}", .{runtime_result});
+            _ = cuCtxDestroy_v2(context);
+            return error.CudaRuntimeInitFailed;
+        }
+        logInfo("✅ CUDA Runtime API initialized successfully", .{});
+
+        // Create cuBLAS handle
+        logInfo("🔍 Creating cuBLAS handle (with library diagnostics)...", .{});
+        var cublas_handle: ?cublasHandle_t = null;
+        const cublas_status = cublasCreate_v2(&cublas_handle);
+        if (cublas_status != CUBLAS_STATUS_SUCCESS) {
+            logInfo("❌ cuBLAS handle creation failed with status code: {}", .{cublas_status});
+            // Provide more detailed error information based on status code
+            switch (cublas_status) {
+                CUBLAS_STATUS_NOT_INITIALIZED => logInfo("❌ ERROR: CUBLAS_STATUS_NOT_INITIALIZED - cuBLAS library not initialized", .{}),
+                CUBLAS_STATUS_ALLOC_FAILED => logInfo("❌ ERROR: CUBLAS_STATUS_ALLOC_FAILED - Resource allocation failed", .{}),
+                CUBLAS_STATUS_INVALID_VALUE => logInfo("❌ ERROR: CUBLAS_STATUS_INVALID_VALUE - Invalid parameter", .{}),
+                CUBLAS_STATUS_ARCH_MISMATCH => logInfo("❌ ERROR: CUBLAS_STATUS_ARCH_MISMATCH - Device compute capability mismatch", .{}),
+                else => logInfo("❌ ERROR: Unknown cuBLAS error code: {}", .{cublas_status}),
+            }
+            _ = cuCtxDestroy_v2(context);
+            return error.CublasInitFailed;
+        }
+        logInfo("✅ cuBLAS handle created successfully", .{});
+
+        logInfo("🚀 CUDA initialization complete!", .{});
+
+        // Initialize a CUDA stream for operations
+        var stream: cudaStream_t = null; // Default stream
+        const stream_status = cudaStreamCreate(&stream);
+        if (stream_status != 0) {
+            logInfo("⚠️ Failed to create CUDA stream, using default stream (status: {})", .{stream_status});
+            stream = null; // Use default stream
+        } else {
+            logInfo("✅ Created CUDA stream for operations", .{});
+        }
+
+        // Setup memory pool
+        var mempool: cudaMemPool_t = null;
+        const pool_status = cudaDeviceGetDefaultMemPool(&mempool, device);
+        if (pool_status != 0) {
+            logInfo("⚠️ Failed to get device memory pool, using default allocation (status: {})", .{pool_status});
+        } else {
+            logInfo("✅ Got device memory pool for efficient allocation", .{});
+            
+            // Configure memory pool to retain memory between operations
+            // Set threshold to max value to keep all memory in the pool
+            const max_value: u64 = std.math.maxInt(u64);
+            const attr_status = cudaMemPoolSetAttribute(mempool, cudaMemPoolAttrReleaseThreshold, &max_value);
+            if (attr_status != 0) {
+                logInfo("⚠️ Failed to configure memory pool retention (status: {})", .{attr_status});
+            } else {
+                logInfo("✅ Configured memory pool for maximum retention", .{});
+            }
+        }
+
+        // Create CUDA event for synchronization
+        var event: cudaEvent_t = null;
+        const event_status = cudaEventCreateWithFlags(&event, cudaEventDisableTiming);
+        if (event_status != 0) {
+            logInfo("⚠️ Failed to create CUDA event for synchronization (status: {})", .{event_status});
+            event = null;
+        } else {
+            logInfo("✅ Created CUDA event for precise synchronization", .{});
+        }
+        
+        logInfo("🚀 CUDA initialization complete with stream-ordered memory allocator and event synchronization!", .{});
 
         return Self{
             .allocator = allocator,
-            .device_id = device,
             .context = context,
+            .cublas_handle = cublas_handle,
+            .stream = stream,
+            .mempool = mempool,
+            .event = event,
         };
     }
 
     pub fn deinit(self: *Self) void {
+        // Destroy cuBLAS handle first
+        if (self.cublas_handle) |handle| {
+            _ = cublasDestroy_v2(handle);
+            self.cublas_handle = null;
+        }
+        
+        // Trim the memory pool to free any unused memory back to the system
+        if (self.mempool != null) {
+            logInfo("🧹 Trimming memory pool to free unused GPU memory", .{});
+            // Free all unused memory (keep 0 bytes in the pool)
+            const trim_status = cudaMemPoolTrimTo(self.mempool.?, 0);
+            if (trim_status != 0) {
+                logInfo("⚠️ Failed to trim memory pool (status: {})", .{trim_status});
+            }
+        }
+        
+        // Destroy the CUDA stream if it's not the default stream
+        if (self.stream != null) {
+            logInfo("🔄 Destroying CUDA stream", .{});
+            const stream_status = cudaStreamDestroy(self.stream.?);
+            if (stream_status != 0) {
+                logInfo("⚠️ Failed to destroy CUDA stream (status: {})", .{stream_status});
+            }
+            self.stream = null;
+        }
+        
+        // Destroy CUDA event if it exists
+        if (self.event != null) {
+            logInfo("🔄 Destroying CUDA event", .{});
+            const event_status = cudaEventDestroy(self.event.?);
+            if (event_status != 0) {
+                logInfo("⚠️ Failed to destroy CUDA event (status: {})", .{event_status});
+            }
+            self.event = null;
+        }
+        
+        // Finally, destroy CUDA context
         if (self.context) |ctx| {
-            _ = cuCtxDestroy(ctx);
+            logInfo("🔄 Destroying CUDA context", .{});
+            _ = cuCtxDestroy_v2(ctx);
+            self.context = null;
         }
     }
 
@@ -76,68 +286,258 @@ const CudaBackend = struct {
         n: usize,
         k: usize,
         alpha: f32,
-        a: CudaBuffer,
+        a: anytype,
         lda: usize,
-        b: CudaBuffer,
+        b: anytype,
         ldb: usize,
         beta: f32,
-        c: CudaBuffer,
+        c: anytype,
         ldc: usize,
     ) !void {
-        _ = self;
-        _ = layout;
-        _ = transa;
-        _ = transb;
-        _ = m;
-        _ = n;
-        _ = k;
-        _ = alpha;
-        _ = a;
-        _ = lda;
-        _ = b;
-        _ = ldb;
-        _ = beta;
-        _ = c;
-        _ = ldc;
-        // For now, return error to trigger fallback
-        return error.CudaNotImplemented;
+        if (self.cublas_handle == null) {
+            return error.CublasHandleNotInitialized;
+        }
+
+        // Convert parameters to appropriate types for cuBLAS
+        const handle = self.cublas_handle.?;
+        const rows = @as(c_int, @intCast(m));
+        const cols = @as(c_int, @intCast(n));
+        const shared_dim = @as(c_int, @intCast(k));
+        const lda_int = @as(c_int, @intCast(lda));
+        const ldb_int = @as(c_int, @intCast(ldb));
+        const ldc_int = @as(c_int, @intCast(ldc));
+
+        // Map transpose operations to cuBLAS constants
+        const cublas_trans_a = switch (transa) {
+            .no_trans => CUBLAS_OP_N,
+            .trans => CUBLAS_OP_T,
+            .conj_trans => CUBLAS_OP_C,
+        };
+
+        const cublas_trans_b = switch (transb) {
+            .no_trans => CUBLAS_OP_N,
+            .trans => CUBLAS_OP_T,
+            .conj_trans => CUBLAS_OP_C,
+        };
+
+        // For cuBLAS, we need to convert row_major to col_major with appropriate transpose adjustments
+        // cuBLAS uses column-major format natively
+        const adj_trans_a = cublas_trans_a;
+        const adj_trans_b = cublas_trans_b;
+        const adj_m = rows;
+        const adj_n = cols;
+        const adj_k = shared_dim;
+        const adj_lda = lda_int;
+        const adj_ldb = ldb_int;
+        const adj_ldc = ldc_int;
+
+        // If input is row-major, we need to adjust for column-major cuBLAS
+        if (layout == .row_major) {
+            // For row-major, we compute C^T = B^T * A^T
+            // Swap A and B, m and n, and adjust transposes
+            // Handle both regular CudaBuffer and PooledCudaBuffer
+            // Get the device pointers using inline switch for different buffer types
+            const b_ptr = switch (@TypeOf(b)) {
+                CudaBuffer => b.ptr,
+                PooledCudaBuffer => @intFromPtr(b.devicePtr(f32)),
+                else => @compileError("Buffer type must be CudaBuffer or PooledCudaBuffer"),
+            };
+            
+            const a_ptr = switch (@TypeOf(a)) {
+                CudaBuffer => a.ptr, 
+                PooledCudaBuffer => @intFromPtr(a.devicePtr(f32)),
+                else => @compileError("Buffer type must be CudaBuffer or PooledCudaBuffer"),
+            };
+            
+            // No actual swap needed, we use the pointers directly
+
+            // Call cuBLAS SGEMM with swapped and adjusted parameters and associate with our CUDA stream
+            // Properly unwrap the optional stream to avoid ??*anyopaque type errors
+            const status = cublasSetStream_v2(handle, if (self.stream != null) self.stream.? else null);
+            if (status != CUBLAS_STATUS_SUCCESS) {
+                logInfo("❌ Failed to set cuBLAS stream: {}", .{status});
+                return error.CublasStreamSetFailed;
+            }
+            
+            // Execute the operation on our configured stream
+            const sgemm_status = cublasSgemm_v2(handle, adj_trans_b, // Was B's transpose
+                adj_trans_a, // Was A's transpose
+                adj_n, // Was n, now m for the swapped operation
+                adj_m, // Was m, now n for the swapped operation
+                adj_k, // k stays the same
+                &alpha, @ptrFromInt(b_ptr), // Was B - convert device ptr to f32 pointer
+                adj_ldb, // Leading dimension of B
+                @ptrFromInt(a_ptr), // Was A - convert device ptr to f32 pointer
+                adj_lda, // Leading dimension of A
+                &beta, @ptrFromInt(switch (@TypeOf(c)) { // Handle both buffer types for C
+                    CudaBuffer => c.ptr,
+                    PooledCudaBuffer => @intFromPtr(c.devicePtr(f32)),
+                    else => @compileError("Buffer type must be CudaBuffer or PooledCudaBuffer"),
+                }), // Convert device ptr to f32 pointer
+                adj_ldc // Leading dimension of C
+            );
+
+            if (sgemm_status != CUBLAS_STATUS_SUCCESS) {
+                logInfo("❌ cuBLAS SGEMM failed with status: {}", .{sgemm_status});
+                return error.CublasSgemmFailed;
+            }
+        } else {
+            // For column-major, standard cuBLAS call but first set the stream
+            // Properly unwrap the optional stream to avoid ??*anyopaque type errors
+            const status = cublasSetStream_v2(handle, if (self.stream != null) self.stream.? else null);
+            if (status != CUBLAS_STATUS_SUCCESS) {
+                logInfo("❌ Failed to set cuBLAS stream: {}", .{status});
+                return error.CublasStreamSetFailed;
+            }
+            
+            // Execute the operation on our configured stream
+            // Get device pointers with correct type handling for both buffer types  
+            const a_ptr = switch (@TypeOf(a)) {
+                CudaBuffer => a.ptr,
+                PooledCudaBuffer => @intFromPtr(a.devicePtr(f32)),
+                else => @compileError("Buffer type must be CudaBuffer or PooledCudaBuffer"),
+            };
+            
+            const b_ptr = switch (@TypeOf(b)) {
+                CudaBuffer => b.ptr, 
+                PooledCudaBuffer => @intFromPtr(b.devicePtr(f32)),
+                else => @compileError("Buffer type must be CudaBuffer or PooledCudaBuffer"),
+            };
+            
+            const c_ptr = switch (@TypeOf(c)) {
+                CudaBuffer => c.ptr,
+                PooledCudaBuffer => @intFromPtr(c.devicePtr(f32)),
+                else => @compileError("Buffer type must be CudaBuffer or PooledCudaBuffer"),
+            };
+            
+            const sgemm_status = cublasSgemm_v2(handle, adj_trans_a, adj_trans_b, adj_m, adj_n, adj_k, &alpha, 
+                                            @ptrFromInt(a_ptr), adj_lda, 
+                                            @ptrFromInt(b_ptr), adj_ldb, 
+                                            &beta, @ptrFromInt(c_ptr), adj_ldc);
+
+            if (sgemm_status != CUBLAS_STATUS_SUCCESS) {
+                logInfo("❌ cuBLAS SGEMM failed with status: {}", .{sgemm_status});
+                return error.CublasSgemmFailed;
+            }
+            
+            // Record event for better synchronization in column-major path
+            if (self.event != null and self.stream != null) {
+                const record_status = cudaEventRecord(self.event.?, self.stream.?);
+                if (record_status != 0) {
+                    logInfo("⚠️ Failed to record CUDA event after SGEMM (status: {})", .{record_status});
+                }
+            }
+        }
+
+        // Record event for better synchronization regardless of matrix layout path
+        if (self.event != null and self.stream != null) {
+            const record_status = cudaEventRecord(self.event.?, self.stream.?);
+            if (record_status != 0) {
+                logInfo("⚠️ Failed to record CUDA event after SGEMM (status: {})", .{record_status});
+            }
+        }
+        
+        logDebug("✅ cuBLAS SGEMM completed successfully", .{});
     }
 
     pub fn synchronize(self: *const Self) !void {
-        _ = self;
-        if (cuCtxSynchronize() != 0) {
-            return error.CudaSyncFailed;
+        // First try to synchronize with event if available (more precise)
+        if (self.event != null) {
+            const event_status = cudaEventSynchronize(self.event.?);
+            if (event_status == 0) {
+                // Event synchronization succeeded
+                return;
+            } else {
+                // Event synchronization failed, log and fall back to stream sync
+                logInfo("⚠️ CUDA event synchronize failed with status: {}, falling back to stream sync", .{event_status});
+                // Clear error state before trying stream sync
+                _ = cudaGetLastError();
+            }
         }
+        
+        // If we have a stream, use stream synchronize instead of context synchronize
+        if (self.stream != null) {
+            const status = cudaStreamSynchronize(self.stream.?);
+            if (status != 0) {
+                logInfo("❌ CUDA stream synchronize failed with status: {}", .{status});
+                
+                // Enhanced error handling with recovery attempt
+                // For CUDA error details, we just log the numeric value
+                // since the string functions need special handling in Zig
+                logInfo("❌ CUDA error details: Error code {}", .{status});
+                
+                // Reset the error state first before returning
+                _ = cudaGetLastError(); // Clear the last error
+                
+                // If this is a temporary error, we could retry synchronization
+                // For now, just return the error with better diagnostics
+                return error.CudaSyncFailed;
+            }
+        } else {
+            // Fall back to context sync if no stream
+            const ctx_status = cuCtxSynchronize();
+            if (ctx_status != 0) {
+                logInfo("❌ CUDA context synchronize failed with status: {}", .{ctx_status});
+                return error.CudaSyncFailed;
+            }
+        }
+    }
+    
+    /// Wait for event completion to ensure proper operation ordering
+    /// This helps prevent race conditions between operations
+    pub fn waitForEvent(self: *const Self, event: cudaEvent_t) !void {
+        if (event == null) return;
+        if (self.stream == null) return;
+        
+        const status = cudaStreamWaitEvent(self.stream, event, 0);
+        if (status != 0) {
+            logInfo("❌ CUDA stream wait event failed with status: {}", .{status});
+            return error.CudaEventWaitFailed;
+        }
+    }
+    
+    /// Create a pooled buffer allocation using the stream-ordered memory allocator
+    /// This is much more efficient than regular CUDA allocations during training
+    pub fn createPooledBuffer(self: *const Self, size: usize) !PooledCudaBuffer {
+        if (self.stream == null) {
+            logInfo("⚠️ No CUDA stream available for pooled buffer, using default stream", .{});
+        }
+        
+        // Unwrap the optional stream - pass null directly if stream is null
+        return PooledCudaBuffer.init(self.allocator, size, if (self.stream != null) self.stream.? else null);
     }
 };
 
-const CudaBuffer = struct {
-    ptr: ?*anyopaque,
+pub const CudaBuffer = struct {
+    ptr: u64, // CUDA device pointer (CUdeviceptr)
     size: usize,
     allocator: Allocator,
 
     pub fn init(allocator: Allocator, size: usize) !CudaBuffer {
-        var ptr: ?*anyopaque = null;
-        if (cuMemAlloc(&ptr, size) != 0) {
+        var device_ptr: u64 = 0; // Use u64 for CUDA device pointer as required by API
+        const result = cuMemAlloc_v2(&device_ptr, size);
+        if (result != 0) {
             return error.CudaMemoryAllocationFailed;
         }
         return CudaBuffer{
-            .ptr = ptr,
+            .ptr = device_ptr,
             .size = size,
             .allocator = allocator,
         };
     }
 
     pub fn deinit(self: *CudaBuffer) void {
-        if (self.ptr) |ptr| {
-            _ = cuMemFree(ptr);
+        if (self.ptr != 0) {
+            _ = cuMemFree_v2(self.ptr);
+            self.ptr = 0;
         }
     }
 
     pub fn copyFromHost(self: *const CudaBuffer, comptime T: type, data: []const T) !void {
         const byte_size = data.len * @sizeOf(T);
         if (byte_size > self.size) return error.BufferTooSmall;
-        if (cuMemcpyHtoD(self.ptr, data.ptr, byte_size) != 0) {
+        const result = cuMemcpyHtoD_v2(self.ptr, data.ptr, byte_size);
+        if (result != 0) {
             return error.CudaCopyFailed;
         }
     }
@@ -145,63 +545,122 @@ const CudaBuffer = struct {
     pub fn copyToHost(self: *const CudaBuffer, comptime T: type, data: []T) !void {
         const byte_size = data.len * @sizeOf(T);
         if (byte_size > self.size) return error.BufferTooSmall;
-        if (cuMemcpyDtoH(data.ptr, self.ptr, byte_size) != 0) {
+        const result = cuMemcpyDtoH_v2(data.ptr, self.ptr, byte_size);
+        if (result != 0) {
             return error.CudaCopyFailed;
         }
     }
 };
 
-// CUDA Driver API - CPU-only stub implementations for seamless fallback
-// Force CPU-only mode for maximum compatibility
-const cuda_disabled = true;
+// CUDA Driver API - Real FFI declarations when CUDA is available, stubs otherwise
+// When build.zig sets CUDA_ENABLED=1, link against real CUDA libraries
+// Otherwise, fall back to stub implementations
+const cuda_disabled = false;
 
-// Stub implementations that return error codes (non-zero) to trigger CPU fallback
-fn cuInit(flags: u32) i32 {
-    _ = flags;
-    return 1;
-}
-fn cuDeviceGetCount(count: *i32) i32 {
-    count.* = 0;
-    return 1;
-}
-fn cuDeviceGet(device: *i32, ordinal: i32) i32 {
-    _ = device;
-    _ = ordinal;
-    return 1;
-}
-fn cuCtxCreate(ctx: *?*anyopaque, flags: u32, device: i32) i32 {
-    _ = ctx;
-    _ = flags;
-    _ = device;
-    return 1;
-}
-fn cuCtxDestroy(ctx: *anyopaque) i32 {
-    _ = ctx;
-    return 1;
-}
-fn cuCtxSynchronize() i32 {
-    return 1;
-}
-fn cuMemAlloc(ptr: *?*anyopaque, size: usize) i32 {
-    _ = ptr;
-    _ = size;
-    return 1;
-}
-fn cuMemFree(ptr: *anyopaque) i32 {
-    _ = ptr;
-    return 1;
-}
-fn cuMemcpyHtoD(dst: ?*anyopaque, src: *const anyopaque, size: usize) i32 {
-    _ = dst;
-    _ = src;
-    _ = size;
-    return 1;
-}
-fn cuMemcpyDtoH(dst: *anyopaque, src: ?*anyopaque, size: usize) i32 {
-    _ = dst;
-    _ = src;
-    _ = size;
-    return 1;
+// CUDA acceleration is enabled for this build
+const enable_real_cuda = true;
+
+// CUDA and cuBLAS FFI declarations using direct extern "c" syntax for maximum compatibility
+
+// CUDA Driver API functions
+pub extern "c" fn cuInit(flags: c_uint) c_int;
+pub extern "c" fn cuDeviceGetCount(count: *c_int) c_int;
+pub extern "c" fn cuDeviceGet(device: *c_int, ordinal: c_int) c_int;
+pub extern "c" fn cuDeviceGetName(name: [*c]u8, len: c_int, dev: c_int) c_int;
+pub extern "c" fn cuDeviceGetAttribute(pi: *c_int, attrib: c_int, dev: c_int) c_int;
+pub extern "c" fn cuCtxCreate_v2(pctx: *?*anyopaque, flags: c_uint, dev: c_int) c_int;
+pub extern "c" fn cuCtxSetCurrent(ctx: ?*anyopaque) c_int;
+pub extern "c" fn cuCtxDestroy_v2(ctx: ?*anyopaque) c_int;
+pub extern "c" fn cuCtxSynchronize() c_int;
+pub extern "c" fn cuMemAlloc_v2(dptr: *u64, bytesize: usize) c_int;
+pub extern "c" fn cuMemcpyHtoD_v2(dstDevice: u64, srcHost: *const anyopaque, ByteCount: usize) c_int;
+pub extern "c" fn cuMemcpyDtoH_v2(dstHost: *anyopaque, srcDevice: u64, ByteCount: usize) c_int;
+pub extern "c" fn cuMemFree_v2(dptr: u64) c_int;
+
+// CUDA Runtime API functions
+pub extern "c" fn cudaFree(ptr: ?*anyopaque) c_int;
+
+// Stream and memory pool types
+pub const cudaStream_t = ?*anyopaque;
+pub const cudaMemPool_t = ?*anyopaque;
+pub const cudaEvent_t = ?*anyopaque;
+
+// Memory pool attributes
+pub const cudaMemPoolAttr = c_int;
+pub const cudaMemPoolAttrReleaseThreshold: cudaMemPoolAttr = 1;
+
+// Stream-ordered memory management API
+pub extern "c" fn cudaDeviceGetDefaultMemPool(memPool: *cudaMemPool_t, device: c_int) c_int;
+pub extern "c" fn cudaMemPoolSetAttribute(memPool: cudaMemPool_t, attr: cudaMemPoolAttr, value: *const anyopaque) c_int;
+pub extern "c" fn cudaMemPoolTrimTo(memPool: cudaMemPool_t, minBytesToKeep: usize) c_int;
+pub extern "c" fn cudaMallocAsync(devPtr: *?*anyopaque, size: usize, stream: cudaStream_t) c_int;
+pub extern "c" fn cudaFreeAsync(devPtr: ?*anyopaque, stream: cudaStream_t) c_int;
+pub extern "c" fn cudaStreamSynchronize(stream: cudaStream_t) c_int;
+pub extern "c" fn cudaStreamCreate(pStream: *cudaStream_t) c_int;
+pub extern "c" fn cudaStreamDestroy(stream: cudaStream_t) c_int;
+
+// CUDA error handling functions
+pub extern "c" fn cudaGetErrorName(err_code: c_int) [*]u8;
+pub extern "c" fn cudaGetErrorString(err_code: c_int) [*]u8;
+pub extern "c" fn cudaGetLastError() c_int;
+
+// CUDA event management
+pub extern "c" fn cudaEventCreate(event: *cudaEvent_t) c_int;
+pub extern "c" fn cudaEventCreateWithFlags(event: *cudaEvent_t, flags: c_uint) c_int;
+pub extern "c" fn cudaEventRecord(event: cudaEvent_t, stream: cudaStream_t) c_int;
+pub extern "c" fn cudaStreamWaitEvent(stream: cudaStream_t, event: cudaEvent_t, flags: c_uint) c_int;
+pub extern "c" fn cudaEventSynchronize(event: cudaEvent_t) c_int;
+pub extern "c" fn cudaEventDestroy(event: cudaEvent_t) c_int;
+
+// cuBLAS API functions
+pub extern "c" fn cublasCreate_v2(handle: *?cublasHandle_t) c_int;
+pub extern "c" fn cublasDestroy_v2(handle: cublasHandle_t) c_int;
+pub extern "c" fn cublasSetStream_v2(handle: cublasHandle_t, streamId: cudaStream_t) c_int;
+pub extern "c" fn cublasSgemm_v2(
+    handle: cublasHandle_t,
+    transa: c_int,
+    transb: c_int,
+    m: c_int,
+    n: c_int,
+    k: c_int,
+    alpha: *const f32,
+    A: *const f32,
+    lda: c_int,
+    B: *const f32,
+    ldb: c_int,
+    beta: *const f32,
+    C: *f32,
+    ldc: c_int,
+) c_int;
+pub extern "c" fn cublasDgemm_v2(
+    handle: cublasHandle_t,
+    transa: c_int,
+    transb: c_int,
+    m: c_int,
+    n: c_int,
+    k: c_int,
+    alpha: *const f64,
+    A: *const f64,
+    lda: c_int,
+    B: *const f64,
+    ldb: c_int,
+    beta: *const f64,
+    C: *f64,
+    ldc: c_int,
+) c_int;
+
+// Wrapper functions have been removed as they've been replaced by direct extern "c" calls
+
+// All wrapper functions have been removed and replaced with direct extern "c" calls
+// Use cuCtxSynchronize(), cuMemAlloc_v2(), cuMemFree_v2(), and cuMemcpyHtoD_v2() directly
+
+fn cuMemcpyDtoH_wrapper(dst: ?*anyopaque, src: ?*anyopaque, size: usize) i32 {
+    if (comptime enable_real_cuda) {
+        return cuMemcpyDtoH_v2(dst, src, size);
+    } else {
+        // Stub implementation - no-op memory copy
+        return 1; // Ignore parameters in stub implementation
+    }
 }
 
 /// Re-export MatrixDims for public use
@@ -209,14 +668,69 @@ pub const MatrixDims = hardware.MatrixDims;
 
 /// Conditional logging that's disabled in release mode for optimal performance
 inline fn logInfo(comptime fmt: []const u8, args: anytype) void {
-    // Always show essential benchmark results
-    std.log.info(fmt, args);
+    // Only show essential info - benchmark results and critical events
+    // In release mode, most BLAS logs are suppressed unless they're critical
+    if (builtin.mode != .Debug) {
+        // In release mode, only show messages containing these important keywords
+        const is_important = isImportantLogMessage(fmt);
+
+        if (is_important) {
+            std.log.info(fmt, args);
+        }
+    } else {
+        // In debug mode, show all info logs
+        std.log.info(fmt, args);
+    }
 }
 
 inline fn logDebug(comptime fmt: []const u8, args: anytype) void {
     if (builtin.mode == .Debug) {
         std.log.debug(fmt, args);
     }
+}
+
+/// Helper function to determine if a log message is important enough to show in release mode
+fn isImportantLogMessage(message: []const u8) bool {
+    // Keywords that make a message important enough to keep
+    const important_keywords = [_][]const u8{
+        "Benchmarking",
+        "Performance:",
+        "GFLOPS",
+        "failed",
+        "error",
+        "Results",
+        "CUDA", // CUDA-related messages are important
+        "critical",
+        "warning",
+        "initialized", // Initialization messages
+        "detected", // Hardware detection messages
+    };
+
+    // Keywords that indicate routine operations that should be filtered
+    const filter_keywords = [_][]const u8{ "Large BLAS operation", "operation", "matrix", "tensor" };
+
+    // Check if it contains any words that indicate it should be filtered
+    for (filter_keywords) |keyword| {
+        if (std.mem.indexOf(u8, message, keyword) != null) {
+            // It contains a filter keyword, don't show unless it also contains an important keyword
+            for (important_keywords) |important| {
+                if (std.mem.indexOf(u8, message, important) != null) {
+                    return true; // Contains both filter and important keywords
+                }
+            }
+            return false; // Contains only filter keywords
+        }
+    }
+
+    // For all other messages, check if they contain important keywords
+    for (important_keywords) |keyword| {
+        if (std.mem.indexOf(u8, message, keyword) != null) {
+            return true;
+        }
+    }
+
+    // Default: don't show general messages in release mode
+    return false;
 }
 
 /// Simple Apple Silicon detection for BLAS optimization
@@ -557,6 +1071,11 @@ pub const Blas = struct {
                 logInfo("⚠️ CUDA initialization failed: {}, falling back to OpenBLAS", .{err});
                 // Create fallback configuration
                 const fallback_hw_info = try allocator.create(HardwareInfo);
+                errdefer {
+                    // If any error occurs after creating fallback_hw_info, ensure it's properly freed
+                    fallback_hw_info.deinit();
+                    allocator.destroy(fallback_hw_info);
+                }
                 fallback_hw_info.* = hw_info;
                 return Blas{
                     .backend = .openblas,
@@ -727,9 +1246,9 @@ pub const Blas = struct {
         }
     }
 
-    /// CUDA SGEMM implementation
+    /// CUDA SGEMM implementation with stream-ordered memory allocator
     fn cudasgemm(
-        self: *const Blas,
+        _: *const Blas,  // self not used directly, use _ to avoid unused param warning
         cuda_ctx: *const CudaBackend,
         layout: MatrixLayout,
         transa: Transpose,
@@ -745,11 +1264,15 @@ pub const Blas = struct {
         const size_a = dims.m * dims.k;
         const size_b = dims.k * dims.n;
         const size_c = dims.m * dims.n;
-
-        // Allocate GPU memory
-        var gpu_a = try CudaBuffer.init(self.allocator, size_a * @sizeOf(f32));
-        var gpu_b = try CudaBuffer.init(self.allocator, size_b * @sizeOf(f32));
-        var gpu_c = try CudaBuffer.init(self.allocator, size_c * @sizeOf(f32));
+        
+        // Use pooled memory allocation for better efficiency
+        // This avoids expensive malloc/free cycles during training
+        logDebug("💡 Using stream-ordered memory allocator for CUDA matrices", .{});
+        
+        // Allocate GPU memory using memory pool
+        var gpu_a = try cuda_ctx.createPooledBuffer(size_a * @sizeOf(f32));
+        var gpu_b = try cuda_ctx.createPooledBuffer(size_b * @sizeOf(f32));
+        var gpu_c = try cuda_ctx.createPooledBuffer(size_c * @sizeOf(f32));
         defer gpu_a.deinit();
         defer gpu_b.deinit();
         defer gpu_c.deinit();
@@ -1062,7 +1585,8 @@ test "BLAS initialization" {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    const blas = try Blas.init(allocator);
+    var blas = try Blas.init(allocator);
+    defer blas.deinit();
     try std.testing.expect(blas.performance_info.peak_gflops > 0);
 }
 
@@ -1071,7 +1595,8 @@ test "matrix multiplication correctness" {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    const blas = try Blas.init(allocator);
+    var blas = try Blas.init(allocator);
+    defer blas.deinit();
 
     // Test 2x2 matrix multiplication
     var matrix_a = [_]f32{ 1.0, 2.0, 3.0, 4.0 };
@@ -1086,3 +1611,68 @@ test "matrix multiplication correctness" {
     try std.testing.expectApproxEqAbs(@as(f32, 43.0), matrix_c[2], 1e-6);
     try std.testing.expectApproxEqAbs(@as(f32, 50.0), matrix_c[3], 1e-6);
 }
+
+/// Stream-ordered memory buffer implementation using CUDA memory pools
+pub const PooledCudaBuffer = struct {
+    ptr: ?*anyopaque, // CUDA device pointer from cudaMallocAsync
+    size: usize,
+    allocator: Allocator,
+    stream: cudaStream_t, // Associated CUDA stream
+
+    /// Initialize a pooled CUDA buffer using the stream-ordered memory allocator
+    /// This uses the CUDA memory pool system to efficiently reuse memory
+    pub fn init(allocator: Allocator, size: usize, stream: cudaStream_t) !PooledCudaBuffer {
+        var device_ptr: ?*anyopaque = null;
+        const result = cudaMallocAsync(&device_ptr, size, stream);
+        if (result != 0) {
+            logInfo("❌ cudaMallocAsync failed with status: {}", .{result});
+            return error.CudaMemoryAllocationFailed;
+        }
+        
+        return PooledCudaBuffer{
+            .ptr = device_ptr,
+            .size = size,
+            .allocator = allocator,
+            .stream = stream,
+        };
+    }
+
+    /// Return memory to the pool rather than immediately freeing it
+    /// This allows faster reuse in subsequent allocations
+    pub fn deinit(self: *PooledCudaBuffer) void {
+        if (self.ptr != null) {
+            _ = cudaFreeAsync(self.ptr, self.stream);
+            self.ptr = null;
+        }
+    }
+
+    /// Copy data from host to device
+    pub fn copyFromHost(self: *const PooledCudaBuffer, comptime T: type, data: []const T) !void {
+        const byte_size = data.len * @sizeOf(T);
+        if (byte_size > self.size) return error.BufferTooSmall;
+        
+        // Use synchronous copy for now (we can add async copy later)
+        const result = cuMemcpyHtoD_v2(@intFromPtr(self.ptr.?), data.ptr, byte_size);
+        if (result != 0) {
+            return error.CudaCopyFailed;
+        }
+    }
+
+    /// Copy data from device to host
+    pub fn copyToHost(self: *const PooledCudaBuffer, comptime T: type, data: []T) !void {
+        const byte_size = data.len * @sizeOf(T);
+        if (byte_size > self.size) return error.BufferTooSmall;
+        
+        // Use synchronous copy for now (we can add async copy later)
+        const result = cuMemcpyDtoH_v2(data.ptr, @intFromPtr(self.ptr.?), byte_size);
+        if (result != 0) {
+            return error.CudaCopyFailed;
+        }
+    }
+
+    // Get the raw device pointer cast to a specific type
+    pub fn devicePtr(self: *const PooledCudaBuffer, comptime T: type) [*c]T {
+        // Fix alignment issues by using both @alignCast and @ptrCast
+        return @ptrCast(@alignCast(self.ptr.?));
+    }
+};

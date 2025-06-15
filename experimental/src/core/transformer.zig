@@ -13,7 +13,7 @@ const model = @import("model.zig");
 const moe = @import("moe.zig");
 
 /// RMS Layer Normalization
-const RMSNorm = struct {
+pub const RMSNorm = struct {
     weight: FloatTensor,
     eps: f32,
     allocator: Allocator,
@@ -63,7 +63,7 @@ const RMSNorm = struct {
 };
 
 /// SwiGLU Activation Function (DeepSeek V3 uses SwiGLU)
-const SwiGLU = struct {
+pub const SwiGLU = struct {
     gate_proj: FloatTensor,
     up_proj: FloatTensor,
     down_proj: FloatTensor,
@@ -166,11 +166,13 @@ pub const TransformerLayer = struct {
     const Self = @This();
 
     pub fn init(allocator: Allocator, layer_idx: u32, config: model.ModelConfig, backend: Backend) !Self {
-        std.log.info("🔧 Initializing Transformer Layer {} (MoE: {})", .{ layer_idx, isMoELayer(layer_idx, config) });
+        logInfo("🔧 Initializing Transformer Layer {} (MoE: {})", .{ layer_idx, isMoELayer(layer_idx, config) });
 
         // Initialize attention with MLA configuration
         const mla_config = attention.MLAConfig{
             .hidden_size = config.hidden_size,
+            .num_heads = config.num_attention_heads,
+            .num_kv_heads = config.num_key_value_heads,
             .num_attention_heads = config.num_attention_heads,
             .num_key_value_heads = config.num_key_value_heads,
             .qk_nope_head_dim = config.qk_nope_head_dim,
@@ -224,7 +226,7 @@ pub const TransformerLayer = struct {
         hidden_states: *const FloatTensor,
         attention_mask: ?*const FloatTensor,
         position_ids: ?*const FloatTensor,
-        past_key_value: ?*attention.KVCache,
+        past_key_value: ?*anyopaque,
         use_cache: bool,
         output: *FloatTensor,
     ) !void {
@@ -232,14 +234,18 @@ pub const TransformerLayer = struct {
         const seq_len = hidden_states.shape.dims[1];
         const hidden_size = hidden_states.shape.dims[2];
 
-        std.log.debug("🚀 Layer {} Forward: batch={}, seq_len={}, hidden_size={}", .{ self.layer_idx, batch_size, seq_len, hidden_size });
+        // FIXED: Properly handle tensor copying to avoid memory aliasing
+        // Create a working copy instead of aliasing the input
+        var current_hidden = try FloatTensor.init(self.allocator, &[_]usize{ batch_size, seq_len, hidden_size });
+        defer current_hidden.deinit();
+        @memcpy(current_hidden.data, hidden_states.data);
 
         // 1. Attention block with residual connection
         var attention_norm_output = try FloatTensor.init(self.allocator, &[_]usize{ batch_size, seq_len, hidden_size });
         defer attention_norm_output.deinit();
 
         // Pre-attention LayerNorm
-        try self.attention_norm.forward(hidden_states, &attention_norm_output);
+        try self.attention_norm.forward(&current_hidden, &attention_norm_output);
 
         // Multi-Head Latent Attention
         var attention_output = try FloatTensor.init(self.allocator, &[_]usize{ batch_size, seq_len, hidden_size });
@@ -254,18 +260,17 @@ pub const TransformerLayer = struct {
             &attention_output,
         );
 
-        // Residual connection
-        var residual1 = try FloatTensor.init(self.allocator, &[_]usize{ batch_size, seq_len, hidden_size });
-        defer residual1.deinit();
-
-        try addTensors(hidden_states, &attention_output, &residual1);
+        // Residual connection: current_hidden = current_hidden + attention_output
+        for (0..current_hidden.data.len) |i| {
+            current_hidden.data[i] = current_hidden.data[i] + attention_output.data[i];
+        }
 
         // 2. Feed-forward block with residual connection
         var mlp_norm_output = try FloatTensor.init(self.allocator, &[_]usize{ batch_size, seq_len, hidden_size });
         defer mlp_norm_output.deinit();
 
         // Pre-MLP LayerNorm
-        try self.mlp_norm.forward(&residual1, &mlp_norm_output);
+        try self.mlp_norm.forward(&current_hidden, &mlp_norm_output);
 
         // Feed-forward (MoE or dense)
         var mlp_output = try FloatTensor.init(self.allocator, &[_]usize{ batch_size, seq_len, hidden_size });
@@ -279,10 +284,13 @@ pub const TransformerLayer = struct {
             return error.NoMLPConfigured;
         }
 
-        // Final residual connection
-        try addTensors(&residual1, &mlp_output, output);
+        // Final residual connection: current_hidden = current_hidden + mlp_output
+        for (0..current_hidden.data.len) |i| {
+            current_hidden.data[i] = current_hidden.data[i] + mlp_output.data[i];
+        }
 
-        std.log.debug("✅ Layer {} Forward completed", .{self.layer_idx});
+        // Copy final result to output - FIXED: Safe copying without aliasing
+        @memcpy(output.data, current_hidden.data);
     }
 
     /// Determine if a layer should use MoE based on DeepSeek V3 architecture
@@ -306,7 +314,7 @@ pub const Transformer = struct {
     const Self = @This();
 
     pub fn init(allocator: Allocator, config: model.ModelConfig, backend: Backend) !Self {
-        std.log.info("🏗️ Initializing DeepSeek V3 Transformer with {} layers", .{config.num_hidden_layers});
+        logInfo("🏗️ Initializing DeepSeek V3 Transformer with {} layers", .{config.num_hidden_layers});
 
         // Allocate transformer layers
         const layers = try allocator.alloc(TransformerLayer, config.num_hidden_layers);
@@ -316,10 +324,10 @@ pub const Transformer = struct {
             layer.* = try TransformerLayer.init(allocator, @intCast(i), config, backend);
         }
 
-        std.log.info("✅ Transformer initialization complete", .{});
-        std.log.info("  Total layers: {}", .{config.num_hidden_layers});
-        std.log.info("  MoE layers: {}", .{countMoELayers(config)});
-        std.log.info("  Dense layers: {}", .{config.num_hidden_layers - countMoELayers(config)});
+        logInfo("✅ Transformer initialization complete", .{});
+        logInfo("  Total layers: {}", .{config.num_hidden_layers});
+        logInfo("  MoE layers: {}", .{countMoELayers(config)});
+        logInfo("  Dense layers: {}", .{config.num_hidden_layers - countMoELayers(config)});
 
         return Self{
             .config = config,
@@ -381,7 +389,7 @@ pub const Transformer = struct {
         hidden_states: *const FloatTensor,
         attention_mask: ?*const FloatTensor,
         position_ids: ?*const FloatTensor,
-        past_key_values: ?[]attention.KVCache,
+        past_key_values: ?*anyopaque,
         use_cache: bool,
         output: *FloatTensor,
     ) !void {
@@ -389,37 +397,26 @@ pub const Transformer = struct {
         const seq_len = hidden_states.shape.dims[1];
         const hidden_size = hidden_states.shape.dims[2];
 
-        std.log.debug("🔥 Transformer Forward: {} layers, batch={}, seq_len={}, hidden_size={}", .{ self.layers.len, batch_size, seq_len, hidden_size });
+        // FIXED: Use separate working tensors to avoid memory aliasing
+        var current_layer_input = try FloatTensor.init(self.allocator, &[_]usize{ batch_size, seq_len, hidden_size });
+        defer current_layer_input.deinit();
+        @memcpy(current_layer_input.data, hidden_states.data);
 
-        // Initialize intermediate tensor for layer outputs
-        var current_hidden = try FloatTensor.init(self.allocator, &[_]usize{ batch_size, seq_len, hidden_size });
-        defer current_hidden.deinit();
-        @memcpy(current_hidden.data, hidden_states.data);
+        var current_layer_output = try FloatTensor.init(self.allocator, &[_]usize{ batch_size, seq_len, hidden_size });
+        defer current_layer_output.deinit();
 
-        var next_hidden = try FloatTensor.init(self.allocator, &[_]usize{ batch_size, seq_len, hidden_size });
-        defer next_hidden.deinit();
+        // Process through each layer (SILENT - no per-layer debug spam)
+        for (self.layers) |*layer| {
+            try layer.forward(&current_layer_input, attention_mask, position_ids, past_key_values, use_cache, &current_layer_output);
 
-        // Pass through each transformer layer
-        for (self.layers, 0..) |*layer, i| {
-            const past_kv = if (past_key_values) |kvs| &kvs[i] else null;
-
-            try layer.forward(
-                &current_hidden,
-                attention_mask,
-                position_ids,
-                past_kv,
-                use_cache,
-                &next_hidden,
-            );
-
-            // Swap tensors for next iteration
-            std.mem.swap(FloatTensor, &current_hidden, &next_hidden);
+            // Swap tensors for next iteration - FIXED: Proper tensor swapping
+            const temp_data = current_layer_input.data;
+            current_layer_input.data = current_layer_output.data;
+            current_layer_output.data = temp_data;
         }
 
-        // Copy final output
-        @memcpy(output.data, current_hidden.data);
-
-        std.log.debug("✅ Transformer Forward completed successfully", .{});
+        // Copy final result to output
+        @memcpy(output.data, current_layer_input.data);
     }
 
     /// Count MoE layers in configuration
@@ -484,4 +481,29 @@ test "transformer initialization" {
     defer transformer.deinit();
 
     try std.testing.expect(transformer.layers.len == 4);
+}
+
+// Conditional logging that's disabled in release mode for optimal performance
+inline fn logInfo(comptime fmt: []const u8, args: anytype) void {
+    // Only log essential information
+    if (std.mem.indexOf(u8, fmt, "Initializing") != null or
+        std.mem.indexOf(u8, fmt, "Complete") != null)
+    {
+        std.log.info(fmt, args);
+    }
+}
+
+inline fn logDebug(comptime fmt: []const u8, args: anytype) void {
+    // Disable debug logging in all modes
+    _ = fmt;
+    _ = args;
+}
+
+inline fn logWarn(comptime fmt: []const u8, args: anytype) void {
+    // Only show critical warnings
+    if (std.mem.indexOf(u8, fmt, "Error") != null or
+        std.mem.indexOf(u8, fmt, "Failed") != null)
+    {
+        std.log.warn(fmt, args);
+    }
 }

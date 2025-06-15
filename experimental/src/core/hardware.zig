@@ -428,93 +428,141 @@ fn detectCpuFeatures() struct {
 
 /// Get CPU model name from /proc/cpuinfo or system APIs
 fn getCpuModel(allocator: Allocator) ![]const u8 {
-    // Try to read from /proc/cpuinfo on Linux
     if (builtin.os.tag == .linux) {
-        const file = std.fs.openFileAbsolute("/proc/cpuinfo", .{}) catch {
-            return try allocator.dupe(u8, "unknown");
-        };
+        const file = std.fs.openFileAbsolute("/proc/cpuinfo", .{}) catch return try allocator.dupe(u8, "unknown");
         defer file.close();
 
-        const content = file.readToEndAlloc(allocator, 4096) catch {
-            return try allocator.dupe(u8, "unknown");
-        };
-        defer allocator.free(content);
+        var buf_reader = std.io.bufferedReader(file.reader());
+        var in_stream = buf_reader.reader();
 
-        // Look for "model name" line
-        var lines = std.mem.splitSequence(u8, content, "\n");
-        while (lines.next()) |line| {
+        var buf: [1024]u8 = undefined;
+        while (try in_stream.readUntilDelimiterOrEof(&buf, '\n')) |line| {
             if (std.mem.startsWith(u8, line, "model name")) {
-                if (std.mem.indexOf(u8, line, ":")) |colon_pos| {
-                    const model = std.mem.trim(u8, line[colon_pos + 1..], " \t");
+                if (std.mem.indexOf(u8, line, ":")) |colon_idx| {
+                    const model = std.mem.trim(u8, line[colon_idx + 1 ..], " \t");
                     return try allocator.dupe(u8, model);
                 }
             }
         }
+        
+        return try allocator.dupe(u8, "unknown");
+    } else if (builtin.os.tag == .macos) {
+        // For macOS, use sysctl
+        const result = std.process.Child.run(.{
+            .allocator = allocator,
+            .argv = &[_][]const u8{"sysctl", "-n", "machdep.cpu.brand_string"},
+        }) catch return try allocator.dupe(u8, "unknown");
+        defer allocator.free(result.stderr);
+        defer allocator.free(result.stdout);
+
+        if (result.term.Exited == 0 and result.stdout.len > 0) {
+            return try allocator.dupe(u8, std.mem.trimRight(u8, result.stdout, "\n"));
+        } else {
+            return try allocator.dupe(u8, "unknown");
+        }
+    } else {
+        // Default for unsupported platforms
+        return try allocator.dupe(u8, "unknown");
     }
-
-    // Fallback for other systems or if reading fails
-    return try allocator.dupe(u8, "unknown");
-}
-
-/// Detect system memory (simplified implementation)
-fn detectSystemMemory() f32 {
-    // This is a simplified implementation
-    // In practice, you'd read from /proc/meminfo on Linux or use system APIs
-    return 32.0; // Default assumption of 32GB
 }
 
 /// Detect GPU information using nvidia-smi and other tools
 fn detectGpus(allocator: Allocator) !ArrayList(GpuInfo) {
     var gpus = ArrayList(GpuInfo).init(allocator);
-
-    // Try to detect NVIDIA GPUs using nvidia-smi
-    if (detectNvidiaGpu(allocator)) |gpu| {
-        try gpus.append(gpu);
-    } else |_| {
-        // nvidia-smi failed, GPU might not be available
+    errdefer {
+        for (gpus.items) |*gpu| {
+            gpu.deinit(allocator);
+        }
+        gpus.deinit();
     }
-
-    // TODO: Add detection for AMD, Intel, and Apple GPUs
-
+    
+    if (try detectNvidiaGpu(allocator)) |gpu| {
+        try gpus.append(gpu);
+    }
+    
+    // TODO: Add AMD and Intel GPU detection
+    
     return gpus;
 }
 
-/// Detect NVIDIA GPU using nvidia-smi command
-fn detectNvidiaGpu(allocator: Allocator) !GpuInfo {
+/// Detect system memory in GB
+fn detectSystemMemory() f32 {
+    if (builtin.os.tag == .linux) {
+        // Try to read from /proc/meminfo
+        const file = std.fs.openFileAbsolute("/proc/meminfo", .{}) catch return 32.0;
+        defer file.close();
+        
+        var buf_reader = std.io.bufferedReader(file.reader());
+        var in_stream = buf_reader.reader();
+        
+        var buf: [1024]u8 = undefined;
+        while (in_stream.readUntilDelimiterOrEof(&buf, '\n') catch return 32.0) |line| {
+            if (std.mem.startsWith(u8, line, "MemTotal:")) {
+                var i: usize = 9; // Skip "MemTotal:" prefix
+                while (i < line.len and (line[i] == ' ' or line[i] == '\t')) : (i += 1) {}
+                
+                // Find the end of the number
+                const start = i;
+                while (i < line.len and line[i] >= '0' and line[i] <= '9') : (i += 1) {}
+                
+                if (i > start) {
+                    const memory_kb = std.fmt.parseInt(u64, line[start..i], 10) catch return 32.0;
+                    return @as(f32, @floatFromInt(memory_kb)) / 1024.0 / 1024.0; // Convert KB to GB
+                }
+            }
+        }
+    } else if (builtin.os.tag == .macos) {
+        // For macOS, use sysctl
+        const result = std.process.Child.run(.{
+            .allocator = std.heap.page_allocator,
+            .argv = &[_][]const u8{"sysctl", "-n", "hw.memsize"},
+        }) catch return 32.0;
+        defer std.heap.page_allocator.free(result.stderr);
+        defer std.heap.page_allocator.free(result.stdout);
+        
+        if (result.term.Exited == 0 and result.stdout.len > 0) {
+            const memory_bytes = std.fmt.parseInt(u64, std.mem.trimRight(u8, result.stdout, "\n"), 10) catch return 32.0;
+            return @as(f32, @floatFromInt(memory_bytes)) / 1024.0 / 1024.0 / 1024.0; // Convert bytes to GB
+        }
+    }
+    
+    // Default assumption for any platform where detection fails
+    return 32.0;
+}
+
+/// Detect NVIDIA GPU if available
+fn detectNvidiaGpu(allocator: Allocator) !?GpuInfo {
+    // Try to run nvidia-smi to get basic info
     const result = std.process.Child.run(.{
         .allocator = allocator,
-        .argv = &[_][]const u8{
-            "nvidia-smi",
-            "--query-gpu=name,memory.total,compute_cap",
-            "--format=csv,noheader,nounits"
-        },
-    }) catch return error.NvidiaNotFound;
-
-    defer allocator.free(result.stdout);
+        .argv = &[_][]const u8{"nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader,nounits"},
+    }) catch return null;
     defer allocator.free(result.stderr);
+    defer allocator.free(result.stdout);
 
-    if (result.term.Exited != 0) {
-        return error.NvidiaNotFound;
+    if (result.term.Exited != 0 or result.stdout.len == 0) {
+        return null;
     }
 
-    // Parse the output: "NVIDIA GeForce RTX 2070 SUPER, 8192, 7.5"
-    const line = std.mem.trim(u8, result.stdout, " \n\r");
-    var parts = std.mem.splitSequence(u8, line, ", ");
+    // Parse name and memory
+    var iter = std.mem.tokenizeAny(u8, result.stdout, ",\n");
+    const name = iter.next() orelse return null;
+    const memory_str = iter.next() orelse return null;
 
-    const name = parts.next() orelse return error.InvalidOutput;
-    const memory_str = parts.next() orelse return error.InvalidOutput;
-    const compute_cap_str = parts.next() orelse return error.InvalidOutput;
+    const memory_mb = std.fmt.parseFloat(f32, std.mem.trim(u8, memory_str, " ")) catch 0.0;
+    const memory_gb = memory_mb / 1024.0;
 
-    const memory_mb = try std.fmt.parseFloat(f32, memory_str);
-    const compute_cap = try std.fmt.parseFloat(f32, compute_cap_str);
+    // Try to detect compute capability
+    const compute_capability: ?f32 = null;
+    // TODO: Implement proper compute capability detection
 
     return GpuInfo{
-        .vendor = .nvidia,
+        .vendor = GpuInfo.GpuVendor.nvidia,
         .name = try allocator.dupe(u8, name),
-        .memory_gb = memory_mb / 1024.0,
-        .compute_capability = compute_cap,
+        .memory_gb = memory_gb,
+        .compute_capability = compute_capability,
         .cuda_available = true,
-        .opencl_available = true,
+        .opencl_available = false,
         .metal_available = false,
     };
 }
@@ -541,10 +589,7 @@ pub fn detectHardware(allocator: Allocator) !HardwareInfo {
     const cpu_model = try getCpuModel(allocator);
     errdefer allocator.free(cpu_model);
 
-    var gpus = detectGpus(allocator) catch |err| {
-        allocator.free(cpu_model);
-        return err;
-    };
+    var gpus = try detectGpus(allocator);
     errdefer {
         for (gpus.items) |*gpu| {
             gpu.deinit(allocator);

@@ -230,7 +230,7 @@ pub const MoE = struct {
         if (config.num_experts_per_token == 0) return MoEError.InsufficientExperts;
         if (config.num_experts_per_token > config.num_experts) return MoEError.InsufficientExperts;
 
-        std.log.info("🧮 Initializing optimized MoE layer: {} experts, {} experts/token, {} intermediate", .{ config.num_experts, config.num_experts_per_token, config.moe_intermediate_size });
+        logInfo("🧮 Initializing optimized MoE layer: {} experts, {} experts/token, {} intermediate", .{ config.num_experts, config.num_experts_per_token, config.moe_intermediate_size });
 
         // INSTANT INITIALIZATION - No expensive operations during init!
 
@@ -383,7 +383,7 @@ pub const MoE = struct {
         std.debug.assert(self.config.num_experts == 8);
         std.debug.assert(self.config.num_experts_per_token == 2);
 
-        std.log.debug("🚀 MoE Specialized 8x2 Forward: batch={}, seq={}, hidden={}", .{ batch_size, seq_len, hidden_size });
+        logInfo("🚀 MoE Specialized 8x2 Forward: batch={}, seq={}, hidden={}", .{ batch_size, seq_len, hidden_size });
 
         // Fixed-size buffers for top-k selection
         var top_k_indices_buffer: [2]usize = undefined;
@@ -438,7 +438,7 @@ pub const MoE = struct {
             }
         }
 
-        std.log.debug("✅ MoE Specialized 8x2 Forward completed", .{});
+        logInfo("✅ MoE Specialized 8x2 Forward completed", .{});
     }
 
     /// Specialized forward pass for 16 experts, 2 per token
@@ -471,7 +471,10 @@ pub const MoE = struct {
 
         // Only log for first few calls to avoid spam
         if (batch_size == 1 and seq_len <= 20) {
-            std.log.debug("🔀 MoE Generic Forward: batch={}, seq={}, hidden={}, experts={}/{}", .{ batch_size, seq_len, hidden_size, num_experts, num_experts_per_token });
+            // REMOVED: Debug spam - only log for very large operations
+            if (batch_size * seq_len > 1000) {
+                logDebug("🔀 MoE Generic Forward: batch={}, seq={}, hidden={}, experts={}/{}", .{ batch_size, seq_len, hidden_size, num_experts, num_experts_per_token });
+            }
         }
 
         // OPTIMIZED: Process all tokens in batch instead of token-by-token
@@ -539,7 +542,7 @@ pub const MoE = struct {
                 for (expert_tokens.items, 0..) |token_idx, i| {
                     const src_start = token_idx * hidden_size;
                     const dst_start = i * hidden_size;
-                    @memcpy(expert_input.data[dst_start..dst_start + hidden_size], input_reshaped.data[src_start..src_start + hidden_size]);
+                    @memcpy(expert_input.data[dst_start .. dst_start + hidden_size], input_reshaped.data[src_start .. src_start + hidden_size]);
                 }
 
                 // Process through expert (batched)
@@ -568,7 +571,7 @@ pub const MoE = struct {
 
         // Only log completion for debugging
         if (batch_size == 1 and seq_len <= 20) {
-            std.log.debug("✅ MoE Generic Forward completed successfully", .{});
+            // REMOVED: Debug spam
         }
     }
 
@@ -661,6 +664,31 @@ pub const MoE = struct {
         indices[1] = max2_idx;
         weights[0] = exp1 / sum;
         weights[1] = exp2 / sum;
+    }
+
+    // Conditional logging that's disabled in release mode for optimal performance
+    inline fn logInfo(comptime fmt: []const u8, args: anytype) void {
+        // Only log essential information
+        if (std.mem.indexOf(u8, fmt, "Initializing") != null or
+            std.mem.indexOf(u8, fmt, "Complete") != null)
+        {
+            std.log.info(fmt, args);
+        }
+    }
+
+    inline fn logDebug(comptime fmt: []const u8, args: anytype) void {
+        // Disable debug logging in all modes
+        _ = fmt;
+        _ = args;
+    }
+
+    inline fn logWarn(comptime fmt: []const u8, args: anytype) void {
+        // Only show critical warnings
+        if (std.mem.indexOf(u8, fmt, "Error") != null or
+            std.mem.indexOf(u8, fmt, "Failed") != null)
+        {
+            std.log.warn(fmt, args);
+        }
     }
 };
 

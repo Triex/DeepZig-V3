@@ -27,6 +27,9 @@ pub const TensorShape = @import("tensor.zig").TensorShape;
 pub const tokenizer = @import("tokenizer.zig");
 pub const Tokenizer = tokenizer.Tokenizer;
 pub const Transformer = @import("transformer.zig").Transformer;
+pub const TransformerLayer = @import("transformer.zig").TransformerLayer;
+pub const RMSNorm = @import("transformer.zig").RMSNorm;
+pub const SwiGLU = @import("transformer.zig").SwiGLU;
 
 // Generation pipeline
 // Generation is now in its own module following Zig best practices

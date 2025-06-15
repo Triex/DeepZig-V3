@@ -143,37 +143,25 @@ pub const Generation = struct {
     ) ![]u8 {
         try config.validate();
 
-        std.log.info("🎯 Generating text for prompt: '{s}'", .{prompt});
-        std.log.debug("📋 Config: temp={d:.2}, top_k={d}, max_tokens={d}", .{
-            config.temperature, config.top_k, config.max_new_tokens
-        });
+        logInfo("🎯 Generating text for prompt: '{s}'", .{prompt});
+        logDebug("📋 Config: temp={d:.2}, top_k={d}, max_tokens={d}", .{ config.temperature, config.top_k, config.max_new_tokens });
 
         // Tokenize input
         const input_tokens = try self.tokenizer.encodeWithSpecialTokens(prompt, true, false);
         defer self.allocator.free(input_tokens);
 
-        std.log.debug("📝 Input tokens: {any}", .{input_tokens});
+        logDebug("📝 Input tokens: {any}", .{input_tokens});
 
         // REAL MODEL INFERENCE: Use the actual model's forward pass
-        std.log.info("🚀 RUNNING REAL MODEL INFERENCE", .{});
-        const response = self.model.generate(
-            self.allocator,
-            prompt,
-            config.max_new_tokens,
-            config.temperature,
-            config.top_k
-        ) catch |err| {
-            std.log.warn("⚠️ Model inference failed: {any}, falling back to error message", .{err});
-            return try std.fmt.allocPrint(
-                self.allocator,
-                "🚨 Model inference error: {any}\n" ++
+        logInfo("🚀 RUNNING REAL MODEL INFERENCE", .{});
+        const response = self.model.generate(self.allocator, prompt, config.max_new_tokens, config.temperature, config.top_k) catch |err| {
+            logWarn("⚠️ Model inference failed: {any}, falling back to error message", .{err});
+            return try std.fmt.allocPrint(self.allocator, "🚨 Model inference error: {any}\n" ++
                 "Input tokens: {d}, Config: temp={d:.1}, top_k={d}\n" ++
-                "This indicates an issue with the model forward pass.",
-                .{ err, input_tokens.len, config.temperature, config.top_k }
-            );
+                "This indicates an issue with the model forward pass.", .{ err, input_tokens.len, config.temperature, config.top_k });
         };
 
-        std.log.info("✅ Generated {d} characters via REAL model inference", .{response.len});
+        logInfo("✅ Generated {d} characters via REAL model inference", .{response.len});
         return response;
     }
 
@@ -352,4 +340,29 @@ test "chat message construction" {
     const msg = ChatMessage.user("Hello!");
     try std.testing.expectEqualStrings("user", msg.role);
     try std.testing.expectEqualStrings("Hello!", msg.content);
+}
+
+// Conditional logging that's disabled in release mode for optimal performance
+inline fn logInfo(comptime fmt: []const u8, args: anytype) void {
+    // Only log essential information
+    if (std.mem.indexOf(u8, fmt, "Generating") != null or
+        std.mem.indexOf(u8, fmt, "Generated") != null)
+    {
+        std.log.info(fmt, args);
+    }
+}
+
+inline fn logDebug(comptime fmt: []const u8, args: anytype) void {
+    // Disable debug logging in all modes
+    _ = fmt;
+    _ = args;
+}
+
+inline fn logWarn(comptime fmt: []const u8, args: anytype) void {
+    // Only show critical warnings
+    if (std.mem.indexOf(u8, fmt, "Error") != null or
+        std.mem.indexOf(u8, fmt, "Failed") != null)
+    {
+        std.log.warn(fmt, args);
+    }
 }

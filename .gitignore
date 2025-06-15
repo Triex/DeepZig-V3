@@ -178,3 +178,5 @@ zig-out/
 # Models
 *.safetensors
 optimizer.pt
+*.pt
+pytorch_model.bin

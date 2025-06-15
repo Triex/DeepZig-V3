@@ -1,0 +1,48 @@
+diff --git a/src/codegen/llvm.zig b/src/codegen/llvm.zig
+index f8aeface59..14f3027e6c 100644
+--- a/src/codegen/llvm.zig
++++ b/src/codegen/llvm.zig
+@@ -6741,7 +6741,8 @@ pub const FuncGen = struct {
+             } else {
+                 const elem_ptr =
+                     try self.wip.gep(.inbounds, array_llvm_ty, array_llvm_val, &indices, "");
+-                return self.loadTruncate(.normal, elem_ty, elem_ptr, .default);
++                const elem_llvm_ty = try o.lowerType(elem_ty);
++                return self.wip.load(.normal, elem_llvm_ty, elem_ptr, .default, "");
+             }
+         }
+
+@@ -6912,12 +6913,13 @@ pub const FuncGen = struct {
+                 const payload_index = @intFromBool(layout.tag_align.compare(.gte, layout.payload_align));
+                 const field_ptr =
+                     try self.wip.gepStruct(union_llvm_ty, struct_llvm_val, payload_index, "");
++                const llvm_field_ty = try o.lowerType(field_ty);
+                 const payload_alignment = layout.payload_align.toLlvm();
+                 if (isByRef(field_ty, zcu)) {
+                     if (canElideLoad(self, body_tail)) return field_ptr;
+                     return self.loadByRef(field_ptr, field_ty, payload_alignment, .normal);
+                 } else {
+-                    return self.loadTruncate(.normal, field_ty, field_ptr, payload_alignment);
++                    return self.wip.load(.normal, llvm_field_ty, field_ptr, payload_alignment, "");
+                 }
+             },
+             else => unreachable,
+@@ -10915,7 +10917,8 @@ pub const FuncGen = struct {
+                   return fg.loadByRef(payload_ptr, payload_ty, payload_alignment, .normal);
+             }
+
+-            return fg.loadTruncate(.normal, payload_ty, payload_ptr, payload_alignment);
++            const payload_llvm_ty = try o.lowerType(payload_ty);
++            return fg.wip.load(.normal, payload_llvm_ty, payload_ptr, payload_alignment, "");
+         }
+
+         assert(!isByRef(payload_ty, zcu));
+@@ -11129,7 +11132,7 @@ pub const FuncGen = struct {
+             if (isByRef(elem_ty, zcu)) {
+                 return self.loadByRef(ptr, elem_ty, ptr_alignment, access_kind);
+             }
+-            return self.loadTruncate(access_kind, elem_ty, ptr, ptr_alignment);
++            return self.wip.load(access_kind, try o.lowerType(elem_ty), ptr, ptr_alignment, "");
+         }
+
+         const containing_int_ty = try o.builder.intType(@intCast(info.packed_offset.host_size * 8));

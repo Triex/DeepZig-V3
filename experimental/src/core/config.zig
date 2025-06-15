@@ -104,8 +104,15 @@ pub const ModelConfig = struct {
         };
         defer parsed.deinit();
 
-        var config = defaultDeepSeekV3();
         const root = parsed.value.object;
+        return try fromJson(allocator, root);
+    }
+
+    /// Parse configuration directly from a JSON object
+    /// This is useful when the JSON has already been parsed elsewhere
+    pub fn fromJson(allocator: Allocator, root: json.ObjectMap) !ModelConfig {
+        _ = allocator; // unused for now but kept for API consistency
+        var config = defaultDeepSeekV3();
 
         // Parse core dimensions
         if (root.get("vocab_size")) |val| config.vocab_size = @intCast(val.integer);
@@ -240,7 +247,7 @@ pub const ModelConfig = struct {
     pub fn smallConfig(allocator: Allocator) !*ModelConfig {
         const config = try allocator.create(ModelConfig);
         config.* = ModelConfig{
-            .vocab_size = 8000,
+            .vocab_size = 3000, // FIXED: Reasonable vocab size (was 8000!)
             .hidden_size = 512,
             .intermediate_size = 1024,
             .num_hidden_layers = 4,
@@ -250,10 +257,10 @@ pub const ModelConfig = struct {
             .qk_nope_head_dim = 32,
             .qk_rope_head_dim = 32,
             .v_head_dim = 64,
-            .num_experts = 2,
-            .num_experts_per_token = 2,
-            .moe_layer_freq = 2,
-            .first_k_dense_replace = 1,
+            .num_experts = 1, // FIXED: No MoE for simplicity
+            .num_experts_per_token = 1,
+            .moe_layer_freq = 1,
+            .first_k_dense_replace = 0,
             .moe_intermediate_size = 512,
         };
         return config;
@@ -326,19 +333,19 @@ pub const ModelConfig = struct {
     pub fn conversationalConfig(allocator: Allocator) !*ModelConfig {
         const config = try allocator.create(ModelConfig);
         config.* = ModelConfig{
-            .vocab_size = 32000,        // Large vocab for conversation tokens
-            .hidden_size = 768,         // Larger for better conversation quality
-            .intermediate_size = 2304,  // SwiGLU: hidden * 3
-            .num_hidden_layers = 12,    // More layers for better reasoning
-            .num_attention_heads = 12,  // More attention heads for context
-            .num_key_value_heads = 12,  // Full attention (not grouped for quality)
-            .max_position_embeddings = 4096,  // Support very long conversations
-            .qk_nope_head_dim = 32,     // MLA dimensions
-            .qk_rope_head_dim = 32,     // RoPE for positional understanding
-            .v_head_dim = 64,           // Value head dimension
-            .num_experts = 1,           // Dense model (no MoE for efficiency)
+            .vocab_size = 32000, // Large vocab for conversation tokens
+            .hidden_size = 768, // Larger for better conversation quality
+            .intermediate_size = 2304, // SwiGLU: hidden * 3
+            .num_hidden_layers = 12, // More layers for better reasoning
+            .num_attention_heads = 12, // More attention heads for context
+            .num_key_value_heads = 12, // Full attention (not grouped for quality)
+            .max_position_embeddings = 4096, // Support very long conversations
+            .qk_nope_head_dim = 32, // MLA dimensions
+            .qk_rope_head_dim = 32, // RoPE for positional understanding
+            .v_head_dim = 64, // Value head dimension
+            .num_experts = 1, // Dense model (no MoE for efficiency)
             .num_experts_per_token = 1,
-            .moe_layer_freq = 1,        // No MoE layers
+            .moe_layer_freq = 1, // No MoE layers
             .first_k_dense_replace = 0,
             .moe_intermediate_size = 2304,
         };
